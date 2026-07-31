@@ -20,7 +20,13 @@ Requires the Swift toolchain from Xcode Command Line Tools. No dependencies.
 ```sh
 findphone            # survey mode: every nearby Apple handheld, by signal
 findphone iphone     # hunt mode: track one device by name (case-insensitive)
+findphone --list     # paired devices and their addresses
 ```
+
+Add `--redact` to mask Bluetooth addresses if you are recording the screen.
+A public address is a stable hardware identifier — unlike BLE advertising
+addresses, it does not rotate — so it is worth keeping out of a screenshot.
+Device names are not masked.
 
 Walk slowly and watch the bar. The reading is signal strength in dBm, which is
 negative and closer to zero when nearer:

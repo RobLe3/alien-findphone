@@ -4,16 +4,21 @@ private let clearScreen = "\u{1B}[2J\u{1B}[H"
 private let huntRule = String(repeating: "=", count: 56)
 private let surveyRule = String(repeating: "-", count: 78)
 
+/// A Bluetooth public address is a stable hardware identifier, so it is worth
+/// hiding when the screen is being recorded.
+private let maskedAddress = "••:••:••:••:••:••"
+
 enum Display {
     /// One write per frame; twenty prints to a line-buffered TTY tears.
-    static func render(_ s: Snapshot) {
-        let lines = s.targetName == nil ? survey(s) : hunt(s)
+    static func render(_ s: Snapshot, redact: Bool = false) {
+        let lines = s.targetName == nil ? survey(s) : hunt(s, redact: redact)
         print(clearScreen + lines.joined(separator: "\n"), terminator: "\n")
         fflush(stdout)
     }
 
-    private static func hunt(_ s: Snapshot) -> [String] {
-        var out = ["Tracking \"\(s.targetName!)\"   \(s.address ?? "")   [\(s.elapsed)s]", huntRule]
+    private static func hunt(_ s: Snapshot, redact: Bool) -> [String] {
+        let address = redact ? maskedAddress : (s.address ?? "")
+        var out = ["Tracking \"\(s.targetName!)\"   \(address)   [\(s.elapsed)s]", huntRule]
 
         if let issue = s.radioIssue {
             return out + ["", "  \(issue)"]
@@ -71,14 +76,14 @@ enum Display {
         return out + [surveyRule, "Ctrl-C to stop."]
     }
 
-    static func list(_ devices: [ClassicDevice]) {
+    static func list(_ devices: [ClassicDevice], redact: Bool = false) {
         guard !devices.isEmpty else {
             print("No paired Bluetooth devices found.")
             return
         }
         print(pad("NAME", 26) + pad("ADDRESS", 20) + pad("RSSI", 7) + "STATE")
         for d in devices {
-            print(pad(d.name, 26) + pad(d.address, 20)
+            print(pad(d.name, 26) + pad(redact ? maskedAddress : d.address, 20)
                   + pad(d.rssi.map(String.init) ?? "-", 7)
                   + (d.connected ? "connected" : "not connected"))
         }
