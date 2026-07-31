@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build universal binary
+        run: ./scripts/build-universal.sh dist
+
+      - name: Smoke test
+        run: |
+          ./dist/findphone --help
+          ./dist/findphone --list
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: findphone-macos-universal
+          path: dist/findphone
+          if-no-files-found: error

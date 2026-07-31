@@ -6,6 +6,19 @@ Built for the case where Find My is unavailable — for example when a device is
 enrolled in MDM that disables it — but the device is still within Bluetooth
 range and you just need to know which corner of the room it is in.
 
+## Install
+
+Grab the universal binary from [Releases](https://github.com/ben-z/findphone/releases):
+
+```sh
+tar -xzf findphone-macos-universal.tar.gz
+xattr -dr com.apple.quarantine findphone
+./findphone --help
+```
+
+It is unsigned, so macOS quarantines it on download; the `xattr` line clears
+that. Requires macOS 13 or later.
+
 ## Build
 
 ```sh
@@ -14,6 +27,11 @@ cp .build/release/findphone ~/bin/findphone
 ```
 
 Requires the Swift toolchain from Xcode Command Line Tools. No dependencies.
+For a universal arm64 + x86_64 binary, which is what CI ships:
+
+```sh
+./scripts/build-universal.sh dist
+```
 
 ## Use
 

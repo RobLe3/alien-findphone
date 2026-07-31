@@ -1,5 +1,9 @@
 .build/
+.build-*/
 .swiftpm/
+dist/
+*.tar.gz
+checksums.txt
 *.o
 *.dSYM
 .DS_Store

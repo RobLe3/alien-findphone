@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build universal binary
+        run: ./scripts/build-universal.sh dist
+
+      - name: Smoke test
+        run: ./dist/findphone --help
+
+      - name: Package
+        run: |
+          cp README.md dist/
+          tar -czf findphone-macos-universal.tar.gz -C dist findphone README.md
+          shasum -a 256 findphone-macos-universal.tar.gz | tee checksums.txt
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOTES: |
+            Universal macOS binary (arm64 + x86_64). Requires macOS 13 or later.
+
+            The binary is unsigned, so macOS quarantines it after download.
+            Clearing that is the third line:
+
+                tar -xzf findphone-macos-universal.tar.gz
+                xattr -dr com.apple.quarantine findphone
+                ./findphone --help
+
+            Needs Bluetooth permission for whichever terminal runs it, under
+            System Settings > Privacy & Security > Bluetooth.
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes "$NOTES" \
+            findphone-macos-universal.tar.gz \
+            checksums.txt
