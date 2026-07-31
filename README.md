@@ -19,7 +19,7 @@ Requires the Swift toolchain from Xcode Command Line Tools. No dependencies.
 
 ```sh
 findphone            # survey mode: every nearby Apple handheld, by signal
-findphone WP         # hunt mode: track one device by name (case-insensitive)
+findphone iphone     # hunt mode: track one device by name (case-insensitive)
 ```
 
 Walk slowly and watch the bar. The reading is signal strength in dBm, which is
