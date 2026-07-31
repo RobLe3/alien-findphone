@@ -3,5 +3,5 @@
 *.o
 *.dSYM
 .DS_Store
-findphone
+/findphone
 *.csv
