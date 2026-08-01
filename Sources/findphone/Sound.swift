@@ -1,10 +1,17 @@
 import AudioToolbox
 import Foundation
 
-/// Geiger-style feedback: the closer the device, the faster the clicks, so a
-/// room can be swept by ear while looking at the room.
+/// Proximity clicks in the manner of a parking sensor: the closer the device,
+/// the faster they come, so a room can be swept by ear while looking at the
+/// room.
 ///
-/// Self-pacing rather than driven by the render loop, which ticks at 4 Hz and
+/// Deliberately not a Geiger counter. A counter clicks once per detected
+/// particle, and the rate is the measurement. Here the rate is a function of
+/// the smoothed signal and no click corresponds to a packet — because packets
+/// arrive on our own 0.3s readRSSI timer, so their rate is near constant with
+/// distance and counting them would drone rather than guide.
+///
+/// Self-paced rather than driven by the render loop, which ticks at 4 Hz and
 /// would cap the cadence at four clicks a second.
 final class Clicker {
     /// Calibrated to what the radio delivers rather than to the display scale:

@@ -41,11 +41,17 @@ findphone iphone     # hunt mode: track one device by name (case-insensitive)
 findphone --list     # paired devices and their addresses
 ```
 
-Add `--sound` in hunt mode for Geiger-style clicks that speed up as you close
-in, from roughly one every two seconds at the far end of a room to eight a
-second at arm's reach. It lets you sweep a room by ear instead of watching the
-screen. Clicks stop when contact goes stale, so silence means no signal rather
-than no device.
+Add `--sound` in hunt mode for clicks that speed up as you close in, the way a
+parking sensor does — about one a second across a room, rising to a buzz once
+the signal reaches roughly -50 dBm, which is about where a laptop sits on top
+of the phone. It lets you sweep a room by ear instead of watching the screen.
+Clicks stop when contact goes stale, so silence means no signal rather than no
+device.
+
+This is not a Geiger counter, despite sounding a little like one. A counter
+clicks once per detected particle and its rate *is* the measurement; here the
+rate is computed from the smoothed signal. Packets arrive on a fixed 0.3s
+polling timer, so their arrival rate says almost nothing about distance.
 
 Add `--redact` if you are recording the screen. It masks Bluetooth addresses,
 and in survey mode replaces discovered device names with the device kind,
