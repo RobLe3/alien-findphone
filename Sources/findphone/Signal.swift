@@ -65,17 +65,19 @@ func bar(_ rssi: Int, width: Int = 24,
         + String(repeating: empty, count: width - filled)
 }
 
+/// How much recent history the displayed reading is drawn from.
+let liveWindow: TimeInterval = 4
+
 /// Whether the signal is climbing, by comparing the last few seconds against
 /// the several before them. Stays unknown until both windows have samples.
 enum Trend {
     case warmer, colder, steady, unknown
 
-    private static let recent: TimeInterval = 3
-    private static let window: TimeInterval = 9
+    private static let window: TimeInterval = 12
     private static let threshold = 3
 
     static func of(_ readings: [Reading], now: Date) -> Trend {
-        let near = readings.since(recent, now: now)
+        let near = readings.since(liveWindow, now: now)
         let prior = readings.since(window, now: now)[..<near.startIndex]
         guard near.count >= 2, prior.count >= 2,
               let new = near.medianRSSI, let old = prior.medianRSSI else { return .unknown }

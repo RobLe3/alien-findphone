@@ -44,7 +44,7 @@ enum Display {
                           "  (~10-20 m), or shut inside something metal."]
         }
 
-        let live = s.readings.since(4, now: s.at).medianRSSI ?? last.rssi
+        let live = s.live ?? last.rssi
         let lastMinute = s.readings.since(60, now: s.at)
         let peak = lastMinute.peakRSSI ?? live
         let age = Int(s.at.timeIntervalSince(last.at).rounded())

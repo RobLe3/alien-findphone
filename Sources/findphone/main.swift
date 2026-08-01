@@ -7,10 +7,11 @@ findphone — locate a nearby Bluetooth device by signal strength
   findphone <name>     track one device by name (case-insensitive)
   findphone --list     show paired devices and their addresses
 
+  --sound              click faster as you get closer (hunt mode)
   --redact             mask Bluetooth addresses, for screen recording
 """
 
-let knownFlags: Set<String> = ["-h", "--help", "--list", "--redact"]
+let knownFlags: Set<String> = ["-h", "--help", "--list", "--redact", "--sound"]
 
 func usageError(_ message: String) -> Never {
     FileHandle.standardError.write(Data("findphone: \(message)\n\n\(usage)\n".utf8))
@@ -40,11 +41,27 @@ if args.contains("--list") {
     exit(0)
 }
 
+/// Clicks only make sense with a single target; survey mode tracks many.
+var clicker: Clicker?
+if args.contains("--sound") {
+    if names.isEmpty {
+        usageError("--sound needs a device name to track")
+    }
+    clicker = Clicker()
+    if clicker == nil {
+        FileHandle.standardError.write(Data("findphone: could not open the click sound\n".utf8))
+    }
+}
+
 let tracker = Tracker(targetName: names.first)
 tracker.start()
 
 Timer.scheduledTimer(withTimeInterval: names.isEmpty ? 1.0 : 0.25, repeats: true) { _ in
-    Display.render(tracker.snapshot(), redact: redact)
+    let snapshot = tracker.snapshot()
+    Display.render(snapshot, redact: redact)
+    if let live = snapshot.live, snapshot.isFresh {
+        clicker?.click(rssi: live, now: snapshot.at)
+    }
 }
 
 RunLoop.main.run()

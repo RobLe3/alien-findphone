@@ -41,6 +41,12 @@ findphone iphone     # hunt mode: track one device by name (case-insensitive)
 findphone --list     # paired devices and their addresses
 ```
 
+Add `--sound` in hunt mode for Geiger-style clicks that speed up as you close
+in, from roughly one every two seconds at the far end of a room to eight a
+second at arm's reach. It lets you sweep a room by ear instead of watching the
+screen. Clicks stop when contact goes stale, so silence means no signal rather
+than no device.
+
 Add `--redact` if you are recording the screen. It masks Bluetooth addresses,
 and in survey mode replaces discovered device names with the device kind,
 since those names are not always yours. A public address is a stable hardware

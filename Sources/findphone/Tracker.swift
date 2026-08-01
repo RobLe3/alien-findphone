@@ -42,6 +42,17 @@ struct Snapshot {
     let radioIssue: String?
     let advertisers: [Advertiser]
     let deviceCount: Int
+
+    /// The reading everything reports: a short median, so one reflected spike
+    /// cannot move the number, the arrow and the clicks apart from each other.
+    var live: Int? {
+        readings.since(liveWindow, now: at).medianRSSI ?? readings.last?.rssi
+    }
+
+    /// Whether the last reading is recent enough to steer by.
+    var isFresh: Bool {
+        readings.last.map { at.timeIntervalSince($0.at) < 10 } ?? false
+    }
 }
 
 private let appleCompanyID: UInt16 = 0x004C
