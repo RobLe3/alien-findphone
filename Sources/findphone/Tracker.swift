@@ -22,11 +22,14 @@ struct Advertiser {
     var types: Set<UInt8>
     var last: Date
 
-    var label: String {
-        if let name { return name }
+    /// What the device is, from its Continuity advertisement. Carries no
+    /// identity, so it is what redacted output falls back to.
+    var kind: String {
         let kinds = types.compactMap { continuityNames[$0] }.sorted()
         return kinds.isEmpty ? "unknown" : kinds.joined(separator: ",")
     }
+
+    var label: String { name ?? kind }
 }
 
 struct Snapshot {

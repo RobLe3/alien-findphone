@@ -41,10 +41,15 @@ findphone iphone     # hunt mode: track one device by name (case-insensitive)
 findphone --list     # paired devices and their addresses
 ```
 
-Add `--redact` to mask Bluetooth addresses if you are recording the screen.
-A public address is a stable hardware identifier — unlike BLE advertising
-addresses, it does not rotate — so it is worth keeping out of a screenshot.
-Device names are not masked.
+Add `--redact` if you are recording the screen. It masks Bluetooth addresses,
+and in survey mode replaces discovered device names with the device kind,
+since those names are not always yours. A public address is a stable hardware
+identifier and, unlike a BLE advertising address, does not rotate, so it is
+worth keeping out of a video.
+
+Two things stay visible deliberately: the name you typed in hunt mode, and the
+names in `--list`, because picking a target means reading them. `--list` is
+not safe to film even with `--redact`.
 
 Walk slowly and watch the bar. The reading is signal strength in dBm, which is
 negative and closer to zero when nearer:

@@ -11,7 +11,7 @@ private let maskedAddress = "••:••:••:••:••:••"
 enum Display {
     /// One write per frame; twenty prints to a line-buffered TTY tears.
     static func render(_ s: Snapshot, redact: Bool = false) {
-        let lines = s.targetName == nil ? survey(s) : hunt(s, redact: redact)
+        let lines = s.targetName == nil ? survey(s, redact: redact) : hunt(s, redact: redact)
         print(clearScreen + lines.joined(separator: "\n"), terminator: "\n")
         fflush(stdout)
     }
@@ -57,7 +57,7 @@ enum Display {
         return out
     }
 
-    private static func survey(_ s: Snapshot) -> [String] {
+    private static func survey(_ s: Snapshot, redact: Bool) -> [String] {
         var out = [
             "Nearby Apple handhelds — live signal   [\(s.elapsed)s, \(s.deviceCount) tracked]",
             "Walk slowly. The one that climbs as you approach a spot is your device.",
@@ -71,7 +71,7 @@ enum Display {
             let stale = s.at.timeIntervalSince(a.last) > 3 ? " (stale)" : ""
             out.append(String(format: "%2d. %@ %4d dBm  peak %4d  ", i + 1, bar(live), live, a.peak)
                        + pad(Proximity.describe(live), Proximity.labelWidth) + stale)
-            out.append("    \(a.label)")
+            out.append("    \(redact ? a.kind : a.label)")
         }
         return out + [surveyRule, "Ctrl-C to stop."]
     }
