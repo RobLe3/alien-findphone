@@ -48,7 +48,9 @@ if args.contains("--sound") {
         usageError("--sound needs a device name to track")
     }
     clicker = Clicker()
-    if clicker == nil {
+    if let clicker {
+        clicker.start()
+    } else {
         FileHandle.standardError.write(Data("findphone: could not open the click sound\n".utf8))
     }
 }
@@ -59,9 +61,7 @@ tracker.start()
 Timer.scheduledTimer(withTimeInterval: names.isEmpty ? 1.0 : 0.25, repeats: true) { _ in
     let snapshot = tracker.snapshot()
     Display.render(snapshot, redact: redact)
-    if let live = snapshot.live, snapshot.isFresh {
-        clicker?.click(rssi: live, now: snapshot.at)
-    }
+    clicker?.update(rssi: snapshot.isFresh ? snapshot.live : nil)
 }
 
 RunLoop.main.run()
