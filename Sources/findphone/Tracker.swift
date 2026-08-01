@@ -265,6 +265,6 @@ final class Tracker: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 }
 
 func fail(_ message: String) -> Never {
-    print(message)
+    FileHandle.standardError.write(Data("findphone: \(message)\n".utf8))
     exit(1)
 }

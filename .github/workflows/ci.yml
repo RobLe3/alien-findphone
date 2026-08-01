@@ -19,6 +19,15 @@ jobs:
           ./dist/findphone --help
           ./dist/findphone --list
 
+      - name: Reject invalid usage
+        run: |
+          if ./dist/findphone --bogus >/dev/null 2>&1; then
+            echo "expected a non-zero exit for an unknown flag"; exit 1
+          fi
+          ./dist/findphone --bogus 2>&1 | grep -q "unknown option '--bogus'"
+          ./dist/findphone one two 2>&1 | grep -q "expected one device name"
+          test -z "$(./dist/findphone --bogus 2>/dev/null)"
+
       - name: Upload binary
         uses: actions/upload-artifact@v7
         with:
