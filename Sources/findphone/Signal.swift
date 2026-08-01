@@ -38,10 +38,15 @@ enum Proximity {
     ]
 
     static let labelWidth = bands.map(\.label.count).max() ?? 0
+    static let bandCount = bands.count
 
-    static func describe(_ rssi: Int) -> String {
-        bands.first { rssi >= $0.floor }?.label ?? "unknown"
+    /// Index into the bands, so callers can key their own tables off the same
+    /// thresholds instead of restating them.
+    static func band(_ rssi: Int) -> Int {
+        bands.firstIndex { rssi >= $0.floor } ?? bands.count - 1
     }
+
+    static func describe(_ rssi: Int) -> String { bands[band(rssi)].label }
 
     /// Fraction of the useful -100..-30 dBm span, clamped to 0...1.
     static func fraction(_ rssi: Int) -> Double {
@@ -53,10 +58,31 @@ func pad(_ s: String, _ width: Int) -> String {
     s.padding(toLength: width, withPad: " ", startingAt: 0)
 }
 
-func bar(_ rssi: Int, width: Int = 24) -> String {
+func bar(_ rssi: Int, width: Int = 24,
+         fill: Character = "#", empty: Character = ".") -> String {
     let filled = Int((Proximity.fraction(rssi) * Double(width)).rounded())
-    return String(repeating: "#", count: filled)
-        + String(repeating: ".", count: width - filled)
+    return String(repeating: fill, count: filled)
+        + String(repeating: empty, count: width - filled)
+}
+
+/// Whether the signal is climbing, by comparing the last few seconds against
+/// the several before them. Stays unknown until both windows have samples.
+enum Trend {
+    case warmer, colder, steady, unknown
+
+    private static let recent: TimeInterval = 3
+    private static let window: TimeInterval = 9
+    private static let threshold = 3
+
+    static func of(_ readings: [Reading], now: Date) -> Trend {
+        let near = readings.since(recent, now: now)
+        let prior = readings.since(window, now: now)[..<near.startIndex]
+        guard near.count >= 2, prior.count >= 2,
+              let new = near.medianRSSI, let old = prior.medianRSSI else { return .unknown }
+        if new - old > threshold { return .warmer }
+        if new - old < -threshold { return .colder }
+        return .steady
+    }
 }
 
 private let sparkLevels = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]

@@ -1,8 +1,19 @@
 import Foundation
 
 private let clearScreen = "\u{1B}[2J\u{1B}[H"
-private let huntRule = String(repeating: "=", count: 56)
+private let huntWidth = 60
+private let margin = "    "
 private let surveyRule = String(repeating: "-", count: 78)
+
+/// Frame-invariant pieces, built once rather than on every redraw.
+private let huntRule = Style.wrap(String(repeating: "─", count: huntWidth), Style.dim)
+private let huntFooter = Style.wrap(
+    " Move a few metres, then stand still ~10s.   Ctrl-C to stop.", Style.dim)
+private let dBmSuffix = Style.wrap("   dBm", Style.dim)
+private let sparkCaption = "1 block = 1 measurement"
+
+/// Indexed by Proximity.band, so the colour cannot drift from the label.
+private let bandTones = [Style.brightGreen, Style.green, Style.yellow, Style.amber, Style.red]
 
 /// A Bluetooth public address is a stable hardware identifier, so it is worth
 /// hiding when the screen is being recorded.
@@ -18,7 +29,11 @@ enum Display {
 
     private static func hunt(_ s: Snapshot, redact: Bool) -> [String] {
         let address = redact ? maskedAddress : (s.address ?? "")
-        var out = ["Tracking \"\(s.targetName!)\"   \(address)   [\(s.elapsed)s]", huntRule]
+        let status = "\(s.link.rawValue) · \(s.elapsed)s"
+        let title = " \(s.targetName!)   \(address)"
+        let gap = max(1, huntWidth - title.count - status.count)
+        let out = [Style.wrap(title + String(repeating: " ", count: gap) + status, Style.dim),
+                   huntRule]
 
         if let issue = s.radioIssue {
             return out + ["", "  \(issue)"]
@@ -32,29 +47,39 @@ enum Display {
         let live = s.readings.since(4, now: s.at).medianRSSI ?? last.rssi
         let lastMinute = s.readings.since(60, now: s.at)
         let peak = lastMinute.peakRSSI ?? live
-        let age = s.at.timeIntervalSince(last.at)
+        let age = Int(s.at.timeIntervalSince(last.at).rounded())
+        let tone = bandTones[Proximity.band(live)]
 
-        out += [
+        let digits = bigNumber(String(live)).enumerated().map { row, glyph in
+            margin + Style.wrap(glyph, tone) + (row == bigTextMiddle ? dBmSuffix : "")
+        }
+
+        let label = Style.wrap(Proximity.describe(live).uppercased(), tone)
+        let trend = trendLabel(Trend.of(s.readings, now: s.at))
+
+        return out + [""] + digits + [
             "",
-            String(format: "        %4d dBm        %@", live, s.link.rawValue),
+            margin + label + "     " + trend,
             "",
-            "   [\(bar(live, width: 38))]",
+            margin + Style.wrap(bar(live, width: 44, fill: "█", empty: "░"), tone),
             "",
-            "   \(sparkline(s.readings.suffix(44)))",
-            "   each block = one real measurement",
-            "",
-            String(format: "   peak/min %4d   measurements %d   last min %d   via %@",
-                   peak, s.readings.count, lastMinute.count, last.source),
-            "",
-            "        >>>  \(Proximity.describe(live))  <<<",
-            "",
-            String(format: "   refreshed %.0fs ago%@", age,
-                   age > 15 ? "  (stale — hold still)" : ""),
-            huntRule,
-            "Move a few metres, then STAND STILL ~10s for a refresh.",
-            "Ctrl-C to stop.",
+            margin + Style.wrap(sparkline(s.readings.suffix(44)), Style.dim),
+            Style.wrap("\(margin)\(sparkCaption) · \(lastMinute.count) last min"
+                       + " · \(s.readings.count) total", Style.dim),
+            Style.wrap("\(margin)peak/min \(peak) · via \(last.source)"
+                       + " · refreshed \(age)s ago", Style.dim),
         ]
-        return out
+        + (age > 15 ? [Style.wrap("\(margin)stale — hold still for a refresh", Style.amber)] : [])
+        + [huntRule, huntFooter]
+    }
+
+    private static func trendLabel(_ trend: Trend) -> String {
+        switch trend {
+        case .warmer:  return Style.wrap("▲ WARMER", Style.brightGreen)
+        case .colder:  return Style.wrap("▼ colder", Style.red)
+        case .steady:  return Style.wrap("· steady", Style.dim)
+        case .unknown: return ""
+        }
     }
 
     private static func survey(_ s: Snapshot, redact: Bool) -> [String] {
