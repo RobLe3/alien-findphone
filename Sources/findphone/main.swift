@@ -12,7 +12,7 @@ findphone — locate a nearby Bluetooth device by signal strength
   --wifi               force-enable Wi‑Fi scanning
   --no-wifi            disable Wi‑Fi scanning
   --anchors <path>     path to optional anchors.json
-  --audio-pack <path>  use custom m4a tracker sound pack (default: detector_asssets/audio.m4a)
+  --audio-pack <path>  use custom m4a tracker sound pack (default: detector_asssets/alien_original_motion_tracker.m4a)
 """
 
 
@@ -93,16 +93,25 @@ tracker.start()
 Timer.scheduledTimer(withTimeInterval: names.isEmpty ? 1.0 : 0.25, repeats: true) { _ in
     let snapshot = tracker.snapshot()
     Display.render(snapshot, redact: redact)
-    if snapshot.focusFresh {
-        let quality = snapshot.focusAsset?.confidence(now: snapshot.at) ?? 0
-        let sourceTags: Set<SignalSource> = snapshot.focusAsset.map { Set($0.sources.keys) } ?? []
-        clicker?.update(
-            rssi: snapshot.focusLive,
-            sources: sourceTags,
-            spectrum: snapshot.sourceDistribution,
-            confidence: quality,
-            estimate: snapshot.estimate
-        )
+    if let focus = snapshot.focusAsset {
+        let age = snapshot.at.timeIntervalSince(focus.last)
+        let shouldSound = age < 18
+        if shouldSound {
+            let live = snapshot.focusLive ?? focus.bestRSSI
+            let staleQuality = focus.confidence(now: snapshot.at)
+            let confidence = snapshot.focusFresh ? staleQuality : staleQuality * 0.55
+            let sourceTags: Set<SignalSource> = Set(focus.sources.keys)
+            clicker?.update(
+                rssi: live,
+                sources: sourceTags,
+                spectrum: snapshot.sourceDistribution,
+                confidence: confidence,
+                estimate: snapshot.estimate,
+                focusIdentity: focus.identity
+            )
+        } else {
+            clicker?.update(rssi: nil)
+        }
     } else {
         clicker?.update(rssi: nil)
     }
@@ -115,6 +124,9 @@ func defaultAudioPackPath() -> String {
     let cwd = FileManager.default.currentDirectoryPath
     let executableDir = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().deletingLastPathComponent().path
     let candidates = [
+        "\(cwd)/detector_asssets/alien_original_motion_tracker.m4a",
+        "\(NSHomeDirectory())/development/findphone/detector_asssets/alien_original_motion_tracker.m4a",
+        "\(executableDir)/detector_asssets/alien_original_motion_tracker.m4a",
         "\(cwd)/detector_asssets/audio.m4a",
         "\(NSHomeDirectory())/development/findphone/detector_asssets/audio.m4a",
         "\(executableDir)/detector_asssets/audio.m4a",

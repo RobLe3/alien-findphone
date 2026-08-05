@@ -50,7 +50,8 @@ findphone --list     # paired devices and their addresses
 ```
 
 Hunt mode defaults to alien GUI and atomized audio feedback from the default
-audio pack (`detector_asssets/audio.m4a`), split into 5 RSSI bands.
+audio pack (`detector_asssets/alien_original_motion_tracker.m4a`), split into 5
+RSSI bands.
 Survey mode also starts the tracker output so nearby stable assets get a continuous
 distance-aware feed automatically.
 
@@ -119,5 +120,5 @@ System Settings > Privacy & Security > Bluetooth. It will say so if missing.
 findphone --wifi        # force-enable Wi‑Fi (default: enabled)
 findphone --no-wifi     # disable Wi‑Fi input
 findphone --anchors     # path to JSON anchor file with optional coordinates
-findphone --audio-pack  # path to custom m4a pack for hunt audio (defaults to detector_asssets/audio.m4a)
+findphone --audio-pack  # path to custom m4a pack for hunt audio (defaults to detector_asssets/alien_original_motion_tracker.m4a)
 ```

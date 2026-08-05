@@ -2,9 +2,9 @@ import Foundation
 import AVFoundation
 import AudioToolbox
 
-/// Distance/location feedback driven by short, irregular atoms extracted from the
-/// detector pack. The approach keeps timing and timing variance in code and keeps
-/// pitch mostly from the source atoms so it still sounds like the original asset.
+/// Distance/location feedback driven by short atoms extracted from the detector pack.
+/// The focus is on preserving the original pack tone while introducing
+/// deterministic motion (survey → hunt → lock) and spectrum-aware selection.
 final class Clicker {
     private struct SoundProfile {
         let interval: TimeInterval
@@ -20,6 +20,25 @@ final class Clicker {
         let count: AVAudioFrameCount
         let energy: Float
         let pitchHz: Float
+        let duration: TimeInterval
+        let toneClass: ToneClass
+        let rms: Float
+    }
+
+    private enum ToneClass: Int, CaseIterable {
+        case short = 0
+        case mid = 1
+        case long = 2
+    }
+
+    private enum TrackerMode: Int, CaseIterable {
+        case survey = 0
+        case track = 1
+        case lock = 2
+        case anchor = 3
+        case fallback = 4
+
+        var id: Int { rawValue }
     }
 
     private enum PitchBand: Int, CaseIterable {
@@ -38,22 +57,26 @@ final class Clicker {
 
     private var atomWindows: [AtomWindow] = []
     private var atomByBand: [PitchBand: [AtomWindow]] = [:]
+    private var atomByMode: [TrackerMode: [AtomWindow]] = [:]
+
+    private var cursorByMode: [Int: Int] = [:]
 
     private var timer: Timer?
-    private var currentBand: Int?
+    private var currentMode: TrackerMode?
+    private var latestRssiBand = 2
     private var token = 0
     private var lastSources: Set<SignalSource> = []
     private var lastInterval: TimeInterval = 0
-
     private var latestConfidence: Double = 0
     private var latestEstimate: TriangulationEstimate?
     private var latestSpectrum: [SignalSource: Int] = [:]
+    private var latestSector = 0
 
     private var fallback: SystemSoundID = 0
     private var fallbackAvailable = false
 
-    private let minPitchHz: Float = 700
-    private let maxPitchHz: Float = 3400
+    private let minPitchHz: Float = 650
+    private let maxPitchHz: Float = 3200
 
     init?(path: String = "/System/Library/Sounds/Tink.aiff") {
         if FileManager.default.fileExists(atPath: path), setupAudioEngine(filePath: path) {
@@ -63,7 +86,8 @@ final class Clicker {
         guard FileManager.default.fileExists(atPath: "/System/Library/Sounds/Tink.aiff"),
               AudioServicesCreateSystemSoundID(
                   URL(fileURLWithPath: "/System/Library/Sounds/Tink.aiff") as CFURL,
-                  &fallback) == kAudioServicesNoError
+                  &fallback
+              ) == kAudioServicesNoError
         else {
             return nil
         }
@@ -101,7 +125,7 @@ final class Clicker {
         let reverb = AVAudioUnitReverb()
 
         reverb.loadFactoryPreset(.smallRoom)
-        reverb.wetDryMix = 9
+        reverb.wetDryMix = 6
         pitch.overlap = 8
         pitch.pitch = 0
         pitch.rate = 1
@@ -130,11 +154,12 @@ final class Clicker {
         self.audioFile = file
         self.atomWindows = discovered
         self.atomByBand = buildAtomByBand(discovered)
+        self.atomByMode = buildAtomByMode(discovered)
         return true
     }
 
     func start() {
-        // Sound is triggered by valid focus data.
+        // Sound is now driven by focus updates.
     }
 
     /// Update atom scheduler from the focused signal state.
@@ -143,7 +168,8 @@ final class Clicker {
         sources: Set<SignalSource> = [],
         spectrum: [SignalSource: Int] = [:],
         confidence: Double = 0,
-        estimate: TriangulationEstimate? = nil
+        estimate: TriangulationEstimate? = nil,
+        focusIdentity: String? = nil
     ) {
         guard let rawRSSI = rssi else {
             stop()
@@ -151,32 +177,35 @@ final class Clicker {
         }
 
         let band = bandIndex(for: rawRSSI)
+        let mode = mode(for: band, confidence: confidence, sources: sources, spectrum: spectrum)
+        let previousMode = currentMode
         let previousSpectrum = latestSpectrum
 
-        let changedBand = currentBand != band
-        let changedSources = sources != lastSources
+        let changedMode = previousMode != mode
+        let changedSources = lastSources != sources
         let changedSpectrum = previousSpectrum != spectrum
 
         latestConfidence = confidence
         latestEstimate = estimate
         latestSpectrum = spectrum
+        latestSector = sectorIndex(for: focusIdentity)
+        latestRssiBand = band
         lastSources = sources
-        currentBand = band
+        currentMode = mode
 
-        let profile = profile(for: band, sources: sources, spectrum: spectrum, confidence: confidence)
-
+        let profile = profile(for: mode, band: band, sources: sources, spectrum: spectrum, confidence: confidence)
         applyProfile(profile)
 
-        if changedBand || changedSources || changedSpectrum {
+        if changedMode || changedSources || changedSpectrum {
             token += 1
             scheduleAtomLoop(interval: profile.interval)
-        } else if timer == nil || abs(lastInterval - profile.interval) > 0.05 {
+        } else if timer == nil || abs(lastInterval - profile.interval) > 0.06 {
             scheduleAtomLoop(interval: profile.interval)
         }
     }
 
     private func scheduleAtomLoop(interval: TimeInterval) {
-        guard currentBand != nil else { return }
+        guard currentMode != nil else { return }
         timer?.invalidate()
 
         let current = token
@@ -185,7 +214,7 @@ final class Clicker {
 
         timer = Timer.scheduledTimer(withTimeInterval: jittered, repeats: false) { [weak self] _ in
             guard let self else { return }
-            guard self.currentBand != nil else { return }
+            guard self.currentMode != nil else { return }
             guard self.token == current else { return }
 
             self.emitAtom()
@@ -202,7 +231,7 @@ final class Clicker {
             emitFallbackAtom()
             return
         }
-        guard let band = currentBand, let profile = currentProfile() else {
+        guard let mode = currentMode, let profile = currentProfile() else {
             emitFallbackAtom()
             return
         }
@@ -211,7 +240,7 @@ final class Clicker {
             player.stop()
         }
 
-        guard let atom = atomWindow(for: band, spectrum: latestSpectrum) else {
+        guard let atom = atomWindow(for: mode, band: latestRssiBand, spectrum: latestSpectrum) else {
             emitFallbackAtom()
             return
         }
@@ -227,11 +256,46 @@ final class Clicker {
         player.scheduleSegment(file, startingFrame: start, frameCount: cappedLength, at: nil)
         player.volume = profile.volume
         player.pan = profile.pan
-        player.play()
 
         pitchUnit?.pitch = profile.pitch
         pitchUnit?.rate = profile.rate
         reverbUnit?.wetDryMix = profile.reverb
+        player.play()
+
+        if mode == .lock, Bool.random(), Bool.random() {
+            emitDoubleTick(after: 0.06)
+        }
+    }
+
+    private func emitDoubleTick(after delay: TimeInterval) {
+        guard player != nil, let file = audioFile else { return }
+        guard let mode = currentMode else { return }
+
+        let next = timerMode(for: mode)
+        guard let atom = atomWindow(for: next, band: latestRssiBand, spectrum: latestSpectrum) else { return }
+        let length = max(1, min(atom.count, AVAudioFrameCount(file.length - atom.start)))
+
+        DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            guard self.currentMode == mode else { return }
+            let profile = self.currentProfile()
+            self.player?.scheduleSegment(file, startingFrame: atom.start, frameCount: length, at: nil)
+            if let profile {
+                self.player?.pan = profile.pan
+                self.player?.volume = max(0, profile.volume - 0.04)
+            }
+            self.player?.play()
+        }
+    }
+
+    private func timerMode(for mode: TrackerMode) -> TrackerMode {
+        switch mode {
+        case .lock: return .lock
+        case .track: return Bool.random() ? .lock : .track
+        case .survey: return .track
+        case .anchor: return .anchor
+        case .fallback: return .track
+        }
     }
 
     private func emitFallbackAtom() {
@@ -240,55 +304,46 @@ final class Clicker {
     }
 
     private func profile(
-        for band: Int,
+        for mode: TrackerMode,
+        band: Int,
         sources: Set<SignalSource>,
         spectrum: [SignalSource: Int],
         confidence: Double
     ) -> SoundProfile {
-        let base = baseProfile(for: band)
+        let base = baseProfile(for: mode)
         let sourceProfile = sourceProfileModifier(for: sources)
         let spectrumProfile = spectrumProfileModifier(for: spectrum)
 
         let conf = max(0.0, min(1.0, confidence))
 
-        let confidenceInterval = base.interval * (1.0 - (conf * 0.25) + (1.0 - conf) * 0.16)
-        let confidenceGain = 0.05 + (0.65 * conf)
+        var interval = base.interval
+        interval = interval * (0.90 - conf * 0.24 + (1.0 - conf) * 0.20)
+        interval = interval * (1.0 + Double(max(0, band - 2)) * 0.12)
 
-        var pan = base.pan + sourceProfile.pan + spectrumProfile.pan
-        if let estimate = latestEstimate {
-            if estimate.sources % 2 == 1 {
-                pan -= 0.03
-            } else {
-                pan += 0.03
-            }
-            if estimate.confidence > 0.65 {
-                pan *= 1.06
-            }
-        }
+        let confidenceGain = 0.05 + (0.55 * conf)
+        let sectorPan = sectorPan(distance: latestDistanceEstimate(), identity: nil)
 
         let pitch = base.pitch + sourceProfile.pitch + spectrumProfile.pitch
-        let rate = max(0.72, min(1.45, base.rate * sourceProfile.rate * spectrumProfile.rate))
-
-        let interval = max(0.12, confidenceInterval)
-        let stablePan = max(-1.0, min(1.0, pan))
-        let stableReverb = min(20, base.reverb + sourceProfile.reverb + spectrumProfile.reverb)
-        let baseGain = base.volume + sourceProfile.volume + spectrumProfile.volume + Float(confidenceGain * 0.08)
-        let stableVolume = Float(max(0.05, min(0.9, Double(baseGain))))
+        let rate = max(0.85, min(1.12, base.rate * sourceProfile.rate * spectrumProfile.rate))
+        let pan = max(-1.0, min(1.0, base.pan + sourceProfile.pan + spectrumProfile.pan + sectorPan))
+        let reverb = max(0.0, min(20.0, base.reverb + sourceProfile.reverb + spectrumProfile.reverb))
+        let volume = Float(max(0.06, min(0.9, Double(base.volume) + Double(sourceProfile.volume) + Double(spectrumProfile.volume) + confidenceGain * 0.08)))
 
         return SoundProfile(
             interval: interval,
             pitch: pitch,
             rate: rate,
-            pan: stablePan,
-            reverb: stableReverb,
-            volume: stableVolume
+            pan: pan,
+            reverb: reverb,
+            volume: volume
         )
     }
 
     private func currentProfile() -> SoundProfile? {
-        guard let band = currentBand else { return nil }
+        guard let mode = currentMode else { return nil }
         return profile(
-            for: band,
+            for: mode,
+            band: latestRssiBand,
             sources: lastSources,
             spectrum: latestSpectrum,
             confidence: latestConfidence
@@ -304,25 +359,25 @@ final class Clicker {
     }
 
     private func currentInterval() -> TimeInterval {
-        guard let band = currentBand else { return 1.0 }
+        guard let mode = currentMode else { return 1.0 }
         guard let profile = currentProfile() else {
-            return baseProfile(for: band).interval
+            return baseProfile(for: mode).interval
         }
         return profile.interval
     }
 
-    private func baseProfile(for band: Int) -> SoundProfile {
-        switch band {
-        case 0:
-            return SoundProfile(interval: 1.05, pitch: -6, rate: 0.90, pan: -0.13, reverb: 6, volume: 0.08)
-        case 1:
-            return SoundProfile(interval: 0.74, pitch: -2, rate: 0.94, pan: -0.06, reverb: 7, volume: 0.12)
-        case 2:
-            return SoundProfile(interval: 0.48, pitch: 0, rate: 1.0, pan: 0.01, reverb: 9, volume: 0.17)
-        case 3:
-            return SoundProfile(interval: 0.30, pitch: 4, rate: 1.02, pan: 0.08, reverb: 10, volume: 0.20)
-        default:
-            return SoundProfile(interval: 0.16, pitch: 8, rate: 1.06, pan: 0.12, reverb: 12, volume: 0.24)
+    private func baseProfile(for mode: TrackerMode) -> SoundProfile {
+        switch mode {
+        case .survey:
+            return SoundProfile(interval: 1.05, pitch: 0, rate: 1.0, pan: -0.10, reverb: 4, volume: 0.09)
+        case .track:
+            return SoundProfile(interval: 0.58, pitch: 1, rate: 1.0, pan: 0.00, reverb: 7, volume: 0.14)
+        case .lock:
+            return SoundProfile(interval: 0.33, pitch: 2, rate: 1.01, pan: 0.04, reverb: 10, volume: 0.20)
+        case .anchor:
+            return SoundProfile(interval: 0.42, pitch: 3, rate: 1.00, pan: -0.02, reverb: 9, volume: 0.17)
+        case .fallback:
+            return SoundProfile(interval: 0.75, pitch: 0, rate: 1.0, pan: 0.0, reverb: 6, volume: 0.12)
         }
     }
 
@@ -334,37 +389,34 @@ final class Clicker {
         var volume: Float = 0
 
         if sources.contains(.wifi) {
-            pitch += 2
-            rate *= 1.04
-            pan -= 0.05
-            reverb += 1
+            pitch += 1
+            rate *= 1.02
+            pan -= 0.04
+            reverb += 0.5
             volume += 0.01
         }
 
         if sources.contains(.bleAdvert) {
             pan += 0.01
-            volume += 0.01
+            volume += 0.008
         }
 
         if sources.contains(.bleLink) {
-            pitch -= 1
-            rate *= 1.02
-            pan += 0.05
-            volume += 0.01
+            pan += 0.03
+            volume += 0.009
         }
 
         if sources.contains(.classic) {
-            pitch += 2
+            pitch += 1
             pan += 0.03
-            rate *= 1.01
-            reverb += 1
+            reverb += 0.4
             volume += 0.01
         }
 
         if sources.contains(.anchor) {
-            rate *= 0.99
-            pan += 0.04
-            reverb += 1
+            pitch += 1
+            pan -= 0.02
+            reverb += 0.6
             volume += 0.01
         }
 
@@ -374,50 +426,85 @@ final class Clicker {
     private func spectrumProfileModifier(for spectrum: [SignalSource: Int]) -> SoundProfile {
         let total = spectrum.values.reduce(0, +)
         let distinct = spectrum.count
-        let weighted = max(0.0, min(1.0, Double(total) / 25.0))
+        let weighted = max(0.0, min(1.0, Double(total) / 24.0))
         let diversity = max(0.0, min(1.0, Double(distinct) / 6.0))
 
-        let pan = Float((diversity - 0.5) * 0.1)
-        let reverb = Float(weighted * 2.2)
-        let pitch = Float(weighted * 4.0)
-        let rate = Float(0.98 + (weighted * 0.09))
+        let pan = Float((weighted - 0.5) * 0.08)
+        let reverb = Float(diversity * 1.8 + weighted * 1.2)
+        let pitch = Float(weighted * 1.8 + diversity * 1.2)
+        let rate = Float(0.99 + (weighted * 0.05) + (diversity * 0.02))
 
-        var volume: Float = 0
-        if total > 12 {
+        let volume: Float
+        if total > 14 {
             volume = 0.01
+        } else if total > 8 {
+            volume = 0.006
+        } else {
+            volume = 0
         }
 
         return SoundProfile(interval: 0, pitch: pitch, rate: rate, pan: pan, reverb: reverb, volume: volume)
     }
 
-    private func atomWindow(for band: Int, spectrum: [SignalSource: Int]) -> AtomWindow? {
-        let windows: [AtomWindow]
-        if atomWindows.isEmpty {
-            windows = fallbackAtoms(fileLength: audioFile?.length ?? 0)
-            if windows.isEmpty { return nil }
-            return windows.randomElement()
+    private func sectorIndex(for identity: String?) -> Int {
+        guard let identity else { return 0 }
+        return abs(identity.utf8.reduce(0, { $0 + Int($1) })) % 8
+    }
+
+    private func sectorPan(distance: Double, identity: String?) -> Float {
+        _ = distance
+        let index = latestSector
+        return Float((Double(index) / 8.0) - 0.5) * 0.55
+    }
+
+    private func latestDistanceEstimate() -> Double {
+        guard let conf = latestEstimate else { return 15 }
+        let x = sqrt(conf.x * conf.x + conf.y * conf.y)
+        return max(0.0, x)
+    }
+
+    private func mode(for band: Int, confidence: Double, sources: Set<SignalSource>, spectrum: [SignalSource: Int]) -> TrackerMode {
+        let sourceCount = spectrum.values.reduce(0, +)
+        if sources.contains(.anchor) || sourceCount >= 5 {
+            return .anchor
+        }
+        if band <= 1 { return .survey }
+        if band == 2 { return confidence >= 0.36 ? .track : .survey }
+        if band >= 3 { return confidence >= 0.55 ? .lock : .track }
+        return .track
+    }
+
+    private func atomWindow(for mode: TrackerMode, band: Int, spectrum: [SignalSource: Int]) -> AtomWindow? {
+        let candidateOrder: [TrackerMode]
+        let preferredBand = preferredPitchBand(for: band)
+
+        if !sourcesAvailable(in: spectrum).isEmpty {
+            let dominant = dominantSourceTag(in: spectrum)
+            switch dominant {
+            case .wifi, .anchor:
+                candidateOrder = [mode, .anchor, .lock, .track, .survey]
+            case .bleAdvert, .bleLink:
+                candidateOrder = [mode, .track, .lock, .anchor, .survey]
+            case .classic:
+                candidateOrder = [mode, .lock, .anchor, .track, .survey]
+            }
+        } else {
+            candidateOrder = [mode, .track, .lock, .anchor, .survey]
         }
 
-        let baseBand = preferredPitchBand(for: band)
-        let spectrumBand = preferredPitchBand(for: spectrum)
-
-        let chooseSpectrum = band == 0 || band == 4 ? 0.20 : 0.30
-        let preferredBand: PitchBand = Double.random(in: 0.0...1.0) < chooseSpectrum ? spectrumBand : baseBand
-
-        let candidateBands: [PitchBand] = {
-            if preferredBand == baseBand {
-                return [preferredBand]
+        for candidate in candidateOrder {
+            let windows = atomByMode[candidate] ?? []
+            let pitchWindows = pitchFiltered(windows, for: preferredBand)
+            if let picked = pickAtom(from: pitchWindows, by: band, mode: candidate) {
+                return picked
             }
-            return [preferredBand, baseBand]
-        }()
 
-        for bandChoice in candidateBands {
-            if let bucket = atomByBand[bandChoice], let picked = pickAtom(from: bucket, by: band) {
+            if let picked = pickAtom(from: windows, by: band, mode: candidate) {
                 return picked
             }
         }
 
-        return pickAtom(from: atomWindows, by: band)
+        return pickAtom(from: atomWindows, by: band, mode: .fallback)
     }
 
     private func preferredPitchBand(for band: Int) -> PitchBand {
@@ -428,39 +515,64 @@ final class Clicker {
         }
     }
 
-    private func preferredPitchBand(for spectrum: [SignalSource: Int]) -> PitchBand {
-        guard !spectrum.isEmpty else { return .mid }
-        guard let dominant = spectrum.max(by: { (lhs, rhs) -> Bool in
+    private func pitchFiltered(_ windows: [AtomWindow], for band: PitchBand) -> [AtomWindow] {
+        guard let fromBand = atomByBand[band], !fromBand.isEmpty, !windows.isEmpty else {
+            return windows
+        }
+        let keys = Set(windows.map { windowKey($0) })
+        let filtered = fromBand.filter { keys.contains(windowKey($0)) }
+        if filtered.isEmpty { return windows }
+        return filtered
+    }
+
+    private func windowKey(_ window: AtomWindow) -> String {
+        "\(window.start):\(window.count)"
+    }
+
+    private func sourcesAvailable(in spectrum: [SignalSource: Int]) -> [SignalSource] {
+        spectrum.filter { $0.value > 0 }.map { $0.key }
+    }
+
+    private func dominantSourceTag(in spectrum: [SignalSource: Int]) -> SignalSource {
+        if let dominant = spectrum.max(by: { lhs, rhs in
             if lhs.value == rhs.value {
                 return lhs.key.rawValue < rhs.key.rawValue
             }
             return lhs.value < rhs.value
-        }) else { return .mid }
-
-        switch dominant.key {
-        case .wifi, .anchor:
-            return .high
-        case .bleLink:
-            return .mid
-        case .bleAdvert:
-            return .low
-        case .classic:
-            return .mid
+        }) {
+            return dominant.key
         }
+        return .bleAdvert
     }
 
-    private func pickAtom(from windows: [AtomWindow], by band: Int) -> AtomWindow? {
+    private func pickAtom(from windows: [AtomWindow], by band: Int, mode: TrackerMode) -> AtomWindow? {
         guard !windows.isEmpty else { return nil }
-        let sorted = windows.sorted { $0.start < $1.start }
-
+        let sorted = windows.sorted { $0.pitchHz < $1.pitchHz }
         let count = sorted.count
-        let bandFactor = max(0.0, min(1.0, Double(band) / 4.0))
-        let center = Int(Double(count - 1) * bandFactor)
-        let spread = max(1, min(4, count / 4))
-        let from = max(0, center - spread)
-        let to = min(count - 1, center + spread)
 
-        return sorted[Int.random(in: from...to)]
+        let target = Double(max(0, min(2, band))) / 2.0
+        let tone = Int(round(target))
+        let base = max(0, min(count - 1, (count - 1) * tone / 3))
+        let spread = max(1, min(5, count / 4))
+        let from = max(0, base - spread)
+        let to = min(count - 1, base + spread)
+
+        var candidateRange = Array(from...to)
+        candidateRange.shuffle()
+
+        var last = cursorByMode[mode.id] ?? Int.random(in: 0..<count)
+        for idx in candidateRange {
+            if idx != last || count == 1 {
+                last = idx
+                cursorByMode[mode.id] = idx
+                return sorted[idx]
+            }
+        }
+
+        let fallback = cursorByMode[mode.id] ?? Int.random(in: 0..<count)
+        let next = (fallback + 1) % count
+        cursorByMode[mode.id] = next
+        return sorted[next]
     }
 
     private func buildAtomByBand(_ windows: [AtomWindow]) -> [PitchBand: [AtomWindow]] {
@@ -507,6 +619,33 @@ final class Clicker {
         return byBand
     }
 
+    private func buildAtomByMode(_ windows: [AtomWindow]) -> [TrackerMode: [AtomWindow]] {
+        var byMode: [TrackerMode: [AtomWindow]] = [
+            .survey: [],
+            .track: [],
+            .lock: [],
+            .anchor: []
+        ]
+
+        for window in windows {
+            byMode[window.toneClass == .short ? .survey : (window.toneClass == .mid ? .track : .lock)]?.append(window)
+            if window.duration < 0.12 || window.pitchHz < 1100 {
+                byMode[.survey, default: []].append(window)
+            }
+            if window.duration > 0.18 {
+                byMode[.anchor, default: []].append(window)
+            }
+        }
+
+        for mode in TrackerMode.allCases where mode != .fallback {
+            if byMode[mode] == nil || byMode[mode]!.isEmpty {
+                byMode[mode] = windows
+            }
+        }
+
+        return byMode
+    }
+
     private func discoverAtoms(in file: AVAudioFile, sampleRate: Double) -> [AtomWindow] {
         guard let samples = readMonoSamples(from: file) else {
             return fallbackAtoms(fileLength: file.length)
@@ -515,80 +654,132 @@ final class Clicker {
             return fallbackAtoms(fileLength: file.length)
         }
 
-        let maxPeak = samples.max() ?? 0
-        guard maxPeak > 0.0001 else {
+        let cleaned = normalize(samples)
+        guard let maxPeak = cleaned.map(abs).max(), maxPeak > 0.00008 else {
             return fallbackAtoms(fileLength: file.length)
         }
 
-        let threshold = maxPeak * 0.18
-        let minFrames = max(256, Int(sampleRate * 0.016))
-        let leadTail = Int(sampleRate * 0.008)
+        let envelope = movingAverage(
+            cleaned.map { abs($0) },
+            window: max(16, Int(sampleRate * 0.006))
+        )
+
+        let noiseFloor = quantile(envelope, 0.45)
+        let mad = medianAbsoluteDeviation(envelope, around: noiseFloor)
+        let threshold = max(0.0008, noiseFloor + mad * 2.6)
+
+        let minGap = Int(sampleRate * 0.012)
+        let pad = Int(sampleRate * 0.012)
 
         var candidates: [AtomWindow] = []
-        var i = 0
-        var start = -1
+        var start: Int?
 
-        while i < samples.count {
-            if samples[i] > threshold {
-                if start < 0 { start = i }
-            } else if start >= 0 {
-                let end = i
-                if end - start >= minFrames {
-                    let windowStart = max(0, start - leadTail)
-                    let windowEnd = min(samples.count, end + leadTail)
-                    let clampedLength = max(1, windowEnd - windowStart)
-                    let energy = rms(samples, from: windowStart, to: windowEnd)
-                    let pitch = estimatePitchHz(samples: samples,
-                                               sampleRate: sampleRate,
-                                               start: windowStart,
-                                               end: windowEnd)
-                    candidates.append(AtomWindow(
-                        start: AVAudioFramePosition(windowStart),
-                        count: AVAudioFrameCount(clampedLength),
-                        energy: energy,
-                        pitchHz: pitch
-                    ))
+        var i = 0
+        while i < envelope.count {
+            if envelope[i] > threshold {
+                if start == nil { start = i }
+            } else if let opened = start {
+                let rawEnd = i
+                let segmentStart = max(0, opened - pad)
+                let segmentEnd = min(samples.count, rawEnd + pad)
+
+                if let atom = makeAtom(start: segmentStart, end: segmentEnd, samples: cleaned, sampleRate: sampleRate) {
+                    candidates.append(atom)
                 }
-                start = -1
+                start = nil
             }
             i += 1
         }
 
-        if start >= 0 {
-            let end = samples.count
-            if end - start >= minFrames {
-                let windowStart = max(0, start - leadTail)
-                let windowEnd = end
-                let clampedLength = max(1, windowEnd - windowStart)
-                let energy = rms(samples, from: windowStart, to: windowEnd)
-                let pitch = estimatePitchHz(samples: samples,
-                                           sampleRate: sampleRate,
-                                           start: windowStart,
-                                           end: windowEnd)
-                candidates.append(AtomWindow(
-                    start: AVAudioFramePosition(windowStart),
-                    count: AVAudioFrameCount(clampedLength),
-                    energy: energy,
-                    pitchHz: pitch
-                ))
+        if let opened = start {
+            let segmentStart = max(0, opened - pad)
+            let segmentEnd = samples.count
+            if let atom = makeAtom(start: segmentStart, end: segmentEnd, samples: cleaned, sampleRate: sampleRate) {
+                candidates.append(atom)
             }
         }
 
-        let sorted = candidates
+        var merged: [AtomWindow] = []
+        for atom in candidates.sorted(by: { $0.start < $1.start }) {
+            if let last = merged.last,
+               atom.start <= last.start + AVAudioFramePosition(atom.count) &&
+               last.start <= atom.start &&
+               atom.start - (last.start + AVAudioFramePosition(last.count)) < AVAudioFramePosition(minGap) {
+                let maxEnd = max(last.start + AVAudioFramePosition(last.count), atom.start + AVAudioFramePosition(atom.count))
+                let mergedAtom = AtomWindow(
+                    start: last.start,
+                    count: AVAudioFrameCount(maxEnd - last.start),
+                    energy: max(last.energy, atom.energy),
+                    pitchHz: atom.pitchHz,
+                    duration: max(atom.duration, last.duration),
+                    toneClass: atom.toneClass,
+                    rms: max(last.rms, atom.rms)
+                )
+                _ = merged.removeLast()
+                merged.append(mergedAtom)
+            } else {
+                merged.append(atom)
+            }
+        }
+
+        let filtered = merged.filter {
+            Double($0.duration) >= 0.085 && Double($0.duration) <= 0.30 && $0.rms > max(0.015, 0.06 * maxPeak)
+        }
+        let sorted = filtered
             .sorted {
                 if $0.energy == $1.energy {
                     return $0.count > $1.count
                 }
                 return $0.energy > $1.energy
             }
-            .prefix(24)
+            .prefix(36)
 
-        let picks = Array(sorted).sorted { $0.start < $1.start }
-        guard !picks.isEmpty else {
+        guard !sorted.isEmpty else {
             return fallbackAtoms(fileLength: file.length)
         }
 
-        return picks
+        return Array(sorted).sorted { $0.start < $1.start }
+    }
+
+    private func makeAtom(start: Int, end: Int, samples: [Float], sampleRate: Double) -> AtomWindow? {
+        guard end > start + 600 else { return nil }
+        let clampedStart = max(0, start)
+        let clampedEnd = min(samples.count, end)
+        guard clampedEnd > clampedStart else { return nil }
+
+        let length = clampedEnd - clampedStart
+        let duration = Double(length) / sampleRate
+        if duration < 0.06 || duration > 0.32 { return nil }
+
+        let energy = rms(samples, from: clampedStart, to: clampedEnd)
+        let peak = peak(samples, from: clampedStart, to: clampedEnd)
+        guard peak > 0 else { return nil }
+        let normalizedEnergy = energy / max(peak, 1e-12)
+
+        let pitch = estimatePitchHz(samples: samples,
+                                   sampleRate: sampleRate,
+                                   start: clampedStart,
+                                   end: clampedEnd)
+
+        let toneClass: ToneClass
+        if duration <= 0.12 {
+            toneClass = .short
+        } else if duration <= 0.19 {
+            toneClass = .mid
+        } else {
+            toneClass = .long
+        }
+
+        let frameCount = AVAudioFrameCount(length)
+        return AtomWindow(
+            start: AVAudioFramePosition(clampedStart),
+            count: frameCount,
+            energy: energy,
+            pitchHz: pitch,
+            duration: duration,
+            toneClass: toneClass,
+            rms: normalizedEnergy
+        )
     }
 
     private func readMonoSamples(from file: AVAudioFile) -> [Float]? {
@@ -622,6 +813,48 @@ final class Clicker {
         return out
     }
 
+    private func normalize(_ samples: [Float]) -> [Float] {
+        guard let peak = samples.max(by: { abs($0) < abs($1) }), abs(peak) > 0.0005 else {
+            return samples
+        }
+        let scale = 1.0 / abs(peak)
+        return samples.map { $0 * scale }
+    }
+
+    private func movingAverage(_ values: [Float], window: Int) -> [Float] {
+        guard !values.isEmpty else { return [] }
+        guard window > 1 else { return values }
+
+        var out = [Float](repeating: 0, count: values.count)
+        var sum: Float = 0
+        let floatWindow = Float(window)
+
+        for idx in 0..<values.count {
+            sum += values[idx]
+            if idx >= window {
+                sum -= values[idx - window]
+                out[idx] = sum / floatWindow
+            } else {
+                out[idx] = sum / Float(idx + 1)
+            }
+        }
+
+        return out
+    }
+
+    private func quantile(_ values: [Float], _ point: Double) -> Float {
+        guard !values.isEmpty else { return 0 }
+        let sorted = values.sorted()
+        let idx = Int((Double(sorted.count - 1) * point).rounded())
+        return sorted[min(max(0, idx), sorted.count - 1)]
+    }
+
+    private func medianAbsoluteDeviation(_ values: [Float], around median: Float) -> Float {
+        guard !values.isEmpty else { return 0 }
+        let shifted = values.map { abs($0 - median) }
+        return quantile(shifted, 0.5)
+    }
+
     private func rms(_ samples: [Float], from start: Int, to end: Int) -> Float {
         guard start < end, end <= samples.count, start >= 0 else { return 0 }
         var acc: Float = 0
@@ -633,6 +866,16 @@ final class Clicker {
         return sqrt(max(0.0, mean))
     }
 
+    private func peak(_ samples: [Float], from start: Int, to end: Int) -> Float {
+        guard start < end, end <= samples.count, start >= 0 else { return 0 }
+        var peak: Float = 0
+        for i in start..<end {
+            let v = abs(samples[i])
+            if v > peak { peak = v }
+        }
+        return peak
+    }
+
     private func estimatePitchHz(samples: [Float], sampleRate: Double, start: Int, end: Int) -> Float {
         guard end > start + 256 else { return 0 }
         let clipStart = max(0, start)
@@ -640,8 +883,8 @@ final class Clicker {
         guard clipEnd > clipStart + 256 else { return 0 }
 
         var segment = Array(samples[clipStart..<clipEnd])
-        let trim = max(0, segment.count / 12)
-        if trim * 3 < segment.count {
+        let trim = max(0, segment.count / 14)
+        if trim * 2 < segment.count {
             segment.removeFirst(trim)
             segment.removeLast(trim)
         }
@@ -680,14 +923,24 @@ final class Clicker {
 
     private func fallbackAtoms(fileLength: AVAudioFramePosition) -> [AtomWindow] {
         guard fileLength >= 8_000 else { return [] }
-        let frameDuration: AVAudioFramePosition = 2_800
-        let step = max(1, fileLength / 5)
+        let frameDuration: AVAudioFramePosition = 2_900
+        let step = max(1, fileLength / 6)
 
-        return (0..<5).compactMap { idx -> AtomWindow? in
+        return (0..<6).compactMap { idx -> AtomWindow? in
             let start = AVAudioFramePosition(idx) * step
             let end = min(fileLength, start + frameDuration)
             guard end > start else { return nil }
-            return AtomWindow(start: start, count: AVAudioFrameCount(end - start), energy: 1, pitchHz: 0)
+            let len = Int(end - start)
+            let duration = Double(len) / 44_100.0
+            return AtomWindow(
+                start: start,
+                count: AVAudioFrameCount(end - start),
+                energy: 1,
+                pitchHz: 1800,
+                duration: duration,
+                toneClass: duration > 0.19 ? .long : .mid,
+                rms: 1
+            )
         }
     }
 
@@ -700,15 +953,15 @@ final class Clicker {
     }
 
     private func jitter(_ interval: TimeInterval) -> TimeInterval {
-        let jitter = Double.random(in: 0.90...1.15)
-        return max(0.09, interval * jitter)
+        let jitter = Double.random(in: 0.92...1.14)
+        return max(0.08, interval * jitter)
     }
 
     private func stop() {
         timer?.invalidate()
         timer = nil
         token += 1
-        currentBand = nil
+        currentMode = nil
         latestConfidence = 0
         latestEstimate = nil
         latestSpectrum.removeAll()

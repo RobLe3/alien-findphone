@@ -165,6 +165,8 @@ enum Display {
             "",
             label + "   " + trend,
             Style.wrap("\(margin)sectors: \(sectorDial(active: sectorIndex(for: focus.identity)))", Style.dim),
+            Style.wrap("\(margin)compass: \(sectorCompass(active: sectorIndex(for: focus.identity)))", Style.dim),
+            "\(margin)range:   \(distanceNeedle(estimatedDistanceMeters(from: focus.bestRSSI), width: 40))",
             "",
             margin + Style.wrap(bar(live, width: meterBarWidth, fill: "█", empty: "░"), tone),
             "",
@@ -190,6 +192,24 @@ enum Display {
     private static func sectorIndex(for identity: String) -> Int {
         let sum = identity.utf8.reduce(0) { acc, b in acc + Int(b) }
         return sectors.isEmpty ? 0 : sum % sectors.count
+    }
+
+    private static func sectorCompass(active: Int) -> String {
+        guard !sectors.isEmpty else { return "--" }
+        return sectors.indices.map { idx in
+            if idx == active % sectors.count {
+                return "[\(sectors[idx])]"
+            }
+            return " \(sectors[idx]) "
+        }.joined(separator: " ")
+    }
+
+    private static func distanceNeedle(_ distance: Double, width: Int = 30) -> String {
+        let maxMeters = 12.0
+        let clamped = max(0.0, min(maxMeters, distance))
+        let fill = Int((1.0 - (clamped / maxMeters)) * Double(width))
+        let empty = max(0, width - fill)
+        return String(repeating: "█", count: fill) + String(repeating: "░", count: empty)
     }
 
     private static func sectorTag(for identity: String, sources: Set<SignalSource>) -> String {
