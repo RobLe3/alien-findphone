@@ -287,6 +287,8 @@ findphone — locate a nearby Bluetooth device by signal strength
   --anchors <path>     path to optional anchors.json
   --audio-pack <path>  use custom m4a tracker sound pack (default: detector_asssets/alien_original_motion_tracker.m4a)
   --replace            replace any already-running detector instance
+  --mute               run without tracker sound (audio disabled)
+  --no-sound           alias for --mute
 """
 
 final class SelectionState {
@@ -370,7 +372,7 @@ while i < args.count {
             values[arg] = args[next]
             options.insert(arg)
             i += 1
-        case "--help", "-h", "--list", "--redact", "--sound", "--wifi", "--no-wifi", "--replace", "--replace-existing":
+        case "--help", "-h", "--list", "--redact", "--sound", "--wifi", "--no-wifi", "--replace", "--replace-existing", "--mute", "--no-sound":
             options.insert(arg)
         default:
             if arg.hasPrefix("--") {
@@ -400,6 +402,7 @@ let enableWiFi = !options.contains("--no-wifi")
 let anchorPath = values["--anchors"]
 let audioPath = resolveAudioPackPath(values["--audio-pack"])
 let replaceExisting = options.contains("--replace") || options.contains("--replace-existing")
+let silentMode = options.contains("--mute") || options.contains("--no-sound") || isAudioMutedByDefault()
 
 if options.contains("--list") {
     Display.list(Classic.devicesByStrength(), redact: redact)
@@ -415,9 +418,11 @@ signal(SIGQUIT, terminalSignalHandler)
 acquireRunLockOrExit(replaceExisting: replaceExisting)
 
 /// Detector audio is default when any tracking is active (hunt + survey).
-activeClicker = Clicker(path: audioPath)
+activeClicker = silentMode ? nil : Clicker(path: audioPath)
 if let clicker = activeClicker {
     clicker.start()
+} else if silentMode {
+    FileHandle.standardError.write(Data("findphone: sound disabled (start with --mute to force quiet mode).\n".utf8))
 } else if FileManager.default.fileExists(atPath: audioPath) {
     FileHandle.standardError.write(Data("findphone: could not open tracker audio at \(audioPath)\n".utf8))
 } else {
@@ -518,4 +523,15 @@ func resolveAudioPackPath(_ explicit: String?) -> String {
     guard let path = explicit else { return defaultAudioPackPath() }
     let expanded = (path as NSString).expandingTildeInPath
     return expanded
+}
+
+private func isAudioMutedByDefault() -> Bool {
+    let env = ProcessInfo.processInfo.environment
+    if env["ALIEN_FINDPHONE_MUTE"]?.lowercased() == "1" || env["ALIEN_FINDPHONE_MUTE"]?.lowercased() == "true" {
+        return true
+    }
+    if env["CI"] != nil {
+        return true
+    }
+    return false
 }

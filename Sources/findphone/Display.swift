@@ -46,8 +46,7 @@ enum Display {
             ? survey(s, columns: columns, rows: rows, density: density, redact: redact, interactive: interactive, highlightedIdentity: highlightedIdentity)
             : hunt(s, columns: columns, rows: rows, density: density, redact: redact, interactive: interactive, highlightedIdentity: highlightedIdentity)
 
-        let fitted = lines.map { clampLine($0, to: columns) }
-        let visible = fitted
+        let visible = lines
         print(clearScreen + visible.joined(separator: "\n"), terminator: "\n")
         fflush(stdout)
     }
@@ -126,7 +125,7 @@ enum Display {
         }
 
         lines.append("")
-        lines.append(huntFooter(interactive: interactive, mode: mode, density: density))
+        lines.append(huntFooter(interactive: interactive, columns: columns))
         return lines
     }
 
@@ -186,7 +185,7 @@ enum Display {
         guard !s.assets.isEmpty else {
             lines.append("  (nothing yet — give it a few seconds)")
             lines.append("")
-            lines.append(interactive ? huntFooter(interactive: interactive, mode: mode, density: density) : "Ctrl-C to stop.")
+            lines.append(interactive ? huntFooter(interactive: interactive, columns: columns) : "Ctrl-C to stop.")
             return lines
         }
 
@@ -206,7 +205,7 @@ enum Display {
             ))
         }
         lines.append("")
-        lines.append(huntFooter(interactive: interactive, mode: mode, density: density))
+        lines.append(huntFooter(interactive: interactive, columns: columns))
         return lines
     }
 
@@ -441,19 +440,22 @@ enum Display {
         print("\nTrack one with:  findphone <name>")
     }
 
-    private static func huntFooter(interactive: Bool, mode: HudMode, density: TinyDensity) -> String {
+    private static func huntFooter(interactive: Bool, columns: Int) -> String {
         guard interactive else {
             return "q or Ctrl-C to stop."
         }
 
-        switch mode {
-        case .wide, .standard:
-            return "  MENU: up(k) / down(j), enter lock, c clear, q/ Ctrl-C to stop"
-        case .compact:
-            return "  MENU: k/j move, enter lock, c clear, q/ Ctrl-C to stop"
-        case .tiny:
-            return tinyMenuLine(density: density)
-        }
+        return menuLine(columns: columns)
+    }
+
+    private static func menuLine(columns: Int) -> String {
+        let options = [
+            "  MENU: up(k) / down(j), enter lock, c clear, q/ Ctrl-C to stop",
+            "  MENU: k/j move, enter lock, c clear, q/ Ctrl-C to stop",
+            "  MENU: U/D move, E lock, C clear, Q quit",
+            "[U][D][E][C][Q]"
+        ]
+        return options.first(where: { $0.count <= columns }) ?? "[U][D][E][C][Q]"
     }
 
     private static func hudMode(_ columns: Int) -> HudMode {
@@ -567,21 +569,6 @@ enum Display {
         return "\(seconds)s\(staleSuffix)"
     }
 
-    private static func tinyMenuLine(density: TinyDensity, compact: Bool = false) -> String {
-        switch density {
-        case .normal:
-            return compact
-                ? "  [U][D] [Enter] [c] [q]"
-                : "  MENU: [U][D]=move, [Enter]=lock, [c]=clear, [q]=quit"
-        case .compact:
-            return compact
-                ? " [U][D] [E] [c] [q]"
-                : " MENU: [U][D] [E] [c] [q]"
-        case .ultra:
-            return compact ? "  U D E c q" : "  U=up D=down E=lock c=clear q=quit"
-        }
-    }
-
     private static func tinyMeterLines(density: TinyDensity) -> Int {
         switch density {
         case .normal:
@@ -661,52 +648,6 @@ enum Display {
     }
 
     private static func visibleCount(_ value: String) -> Int {
-        value.reduce(0) { count, _ in count + 1 }
-    }
-
-    private static func clampLine(_ text: String, to columns: Int) -> String {
-        if columns <= 0 { return "" }
-        var out = ""
-        var visible = 0
-        var index = text.startIndex
-        var styleOpen = false
-
-        while index < text.endIndex && visible < columns {
-            if text[index] == "\u{1B}" {
-                let next = text.index(after: index)
-                if next < text.endIndex && text[next] == "[" {
-                    var end = next
-                    while end < text.endIndex, text[end] != "m" {
-                        end = text.index(after: end)
-                    }
-                    if end < text.endIndex {
-                        let sequence = text[index...end]
-                        out += sequence
-                        if sequence.hasSuffix("[0m") || sequence.hasSuffix("[39m") || sequence.hasSuffix("[49m") {
-                            styleOpen = false
-                        } else {
-                            styleOpen = true
-                        }
-                        index = text.index(after: end)
-                        continue
-                    }
-                }
-
-                out.append(text[index])
-                visible += 1
-                index = next
-                continue
-            }
-
-            let ch = text[index]
-            out.append(ch)
-            visible += 1
-            index = text.index(after: index)
-        }
-
-        if styleOpen && index < text.endIndex {
-            out += "\u{1B}[0m"
-        }
-        return out
+        value.count
     }
 }

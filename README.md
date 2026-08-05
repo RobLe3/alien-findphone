@@ -57,6 +57,19 @@ findphone --replace
 ```
 to replace the stale process before you rebuild/run again.
 
+For hands-on dev where you don't want any audio feedback, use:
+
+```sh
+findphone --mute --replace --no-wifi
+```
+
+or:
+
+```sh
+export ALIEN_FINDPHONE_MUTE=1
+findphone --replace --no-wifi
+```
+
 Requires the Swift toolchain from Xcode Command Line Tools. No dependencies.
 
 ## Use
@@ -69,6 +82,8 @@ findphone --list     # paired devices and their addresses
 
 In interactive terminal mode, use up/down (or j/k) and Enter to lock a highlighted
 candidate, and `c` to clear manual lock.
+The menu is now adaptive: in wide terminals it mirrors the classic full-width
+menu format and collapses to compact symbols on narrow terminals.
 
 Hunt mode defaults to the alien GUI and motion-tracker sound from the default
 audio pack (`detector_asssets/alien_original_motion_tracker.m4a`), split into 5
@@ -143,7 +158,11 @@ findphone --no-wifi     # disable Wi‑Fi input
 findphone --anchors     # path to JSON anchor file with optional coordinates
 findphone --audio-pack  # path to custom m4a pack for hunt audio (defaults to detector_asssets/alien_original_motion_tracker.m4a)
 findphone --replace     # stop any existing detector process and start fresh
+findphone --mute        # keep tracker silent
+findphone --no-sound    # alias for --mute
 ```
+
+You can also set `ALIEN_FINDPHONE_MUTE=1` for the same silent behavior.
 
 ## Interactive controls
 
