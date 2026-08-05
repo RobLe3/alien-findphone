@@ -424,14 +424,14 @@ signal(SIGQUIT, terminalSignalHandler)
 
 acquireRunLockOrExit(replaceExisting: replaceExisting)
 
-/// Detector audio is default when any tracking is active (hunt + survey).
-activeClicker = silentMode ? nil : Clicker(path: audioPath)
-if let clicker = activeClicker {
+/// Detector audio is enabled by default when not muted.
+if silentMode {
+    activeClicker = nil
+} else if let clicker = Clicker(path: audioPath) {
     clicker.start()
-} else if silentMode {
-    FileHandle.standardError.write(Data("findphone: sound disabled (start with --mute to force quiet mode).\n".utf8))
+    activeClicker = clicker
 } else {
-    FileHandle.standardError.write(Data("findphone: tracker audio not available, using silent mode\n".utf8))
+    FileHandle.standardError.write(Data("findphone: tracker audio not available. run with --mute for silent mode.\n".utf8))
 }
 
 let tracker = Tracker(targetName: names.first, enableWiFi: enableWiFi, anchorPath: anchorPath)
@@ -482,27 +482,43 @@ Timer.scheduledTimer(withTimeInterval: drawInterval, repeats: true) { _ in
                 && snapshot.selectedIdentity != nil
                 && snapshot.selectedIdentity != focus.identity
             if staleLock {
-                activeClicker?.update(rssi: nil)
+                activeClicker?.update(
+                    state: TargetAudioState(
+                        identifier: snapshot.selectedIdentity,
+                        rssi: nil,
+                        confidence: 0,
+                        lastSeen: snapshot.at,
+                        isLocked: true
+                    )
+                )
                 return
             }
             let live = snapshot.focusLive ?? focus.bestRSSI
             let staleQuality = focus.confidence(now: snapshot.at)
             let confidence = snapshot.focusFresh ? staleQuality : staleQuality * 0.55
-            let sourceTags: Set<SignalSource> = Set(focus.sources.keys)
             activeClicker?.update(
-                rssi: live,
-                sources: sourceTags,
-                spectrum: snapshot.sourceDistribution,
-                confidence: confidence,
-                estimate: snapshot.estimate,
-                focusIdentity: snapshot.selectedIdentity ?? focus.identity
+                state: TargetAudioState(
+                    identifier: snapshot.selectedIdentity,
+                    rssi: live,
+                    confidence: confidence,
+                    lastSeen: snapshot.at,
+                    isLocked: snapshot.selectedIdentity == snapshot.focusAsset?.identity
+                )
             )
             return
         }
     }
 
     if !shouldSound {
-        activeClicker?.update(rssi: nil)
+        activeClicker?.update(
+            state: TargetAudioState(
+                identifier: snapshot.selectedIdentity,
+                rssi: nil,
+                confidence: 0,
+                lastSeen: snapshot.at,
+                isLocked: snapshot.isManualTracking
+            )
+        )
     }
 }
 

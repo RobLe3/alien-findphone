@@ -8,7 +8,7 @@ private let audioDebugEnv = "ALIEN_FINDPHONE_AUDIO_DEBUG"
 private let audioFileOverrideEnv = "ALIEN_FINDPHONE_AUDIO_FILE"
 private let audioFallbackEnv = "ALIEN_FINDPHONE_ALLOW_SYSTEM_SOUND_FALLBACK"
 
-enum AudioSourceResolution {
+enum AudioSourceResolution: Equatable {
     case explicitPath(String)
     case overrideEnv(String)
     case bundled
@@ -41,13 +41,13 @@ final class Clicker {
     private var sourceFormat: AVAudioFormat?
     private var sourceBuffer: AVAudioPCMBuffer?
     private(set) var sourceURL: URL?
-    private var exactFramesPerBeat: Double = 0
-    private var firstBeatFrame: AVAudioFramePosition = 0
-    private(set) var beatCellCount: Int = 0
     private(set) var resolution: AudioSourceResolution = .missing
 
     private var idlePairs: [BeatPair] = []
     private var trackingPairs: [BeatPair] = []
+
+    private var exactFramesPerBeat: Double = 0
+    private(set) var beatCellCount: Int = 0
 
     private var currentPairIndex = 0
     private var requestedPairIndex = 0
@@ -55,7 +55,7 @@ final class Clicker {
     private var pairHoldProximity = 0.0
     private var nextBeatNumber = 0
     private var queuedBeatCount = 0
-    private var pairAdjustmentAnchorBeat = 0
+    private var pairChangeBoundaryBeat = 0
 
     private var mode: TrackerAudioMode = .idle
     private var staleState: TargetFreshness = .stale
@@ -63,21 +63,39 @@ final class Clicker {
     private var isStopping = false
     private var lookAheadTimer: DispatchSourceTimer?
     private var fallbackTimer: DispatchSourceTimer?
-    private let lookAheadBeats = 4
+    private let lookAheadBeats = 2
+    private let lookAheadLowWatermark = 1
     private let lookAheadInterval: TimeInterval = 0.08
-    private var debugScheduledSampleFrame: AVAudioFramePosition = 0
 
     private var filter: AudioProximityFilter
     private var lastTargetSeen: Date?
     private var confidence = 0.0
-    private var sector = 0
-    private var lastPairUpdate: Int = 0
+
+    private var activeTargetIdentity: String?
 
     private var engineStartCount = 0
-    private var lateScheduleCount = 0
+    private var underrunCount = 0
+    private var completedBeatCount = 0
+    private var scheduledBeatCount = 0
 
     private var usedSystemFallback = false
     private var systemFallbackSound: SystemSoundID = 0
+
+    var diagnostics: AudioBeatDiagnostics {
+        let pairCount = max(1, activePairs().count)
+        return AudioBeatDiagnostics(
+            requestedPair: requestedPairIndex,
+            currentPair: currentPairIndex,
+            scheduledBeat: nextBeatNumber,
+            queuedBeats: queuedBeatCount,
+            underrunCount: underrunCount,
+            scheduledBeatCount: scheduledBeatCount,
+            completedBeatCount: completedBeatCount,
+            filteredProximity: filter.filtered,
+            sourcePairCount: pairCount,
+            engineRestarts: engineStartCount
+        )
+    }
 
     init?(path: String? = nil) {
         debugEnabled = {
@@ -89,7 +107,6 @@ final class Clicker {
             standardFormatWithSampleRate: 44_100,
             channels: 2
         ) ?? AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 44_100, channels: 2, interleaved: false)!
-        sourceBuffer = nil
 
         filter = AudioProximityFilter(attackTau: profile.attackTau, releaseTau: profile.releaseTau)
 
@@ -102,13 +119,13 @@ final class Clicker {
             if allowFallback, let fallback = Clicker.configureFallbackSystemSound() {
                 usedSystemFallback = true
                 resolution = .fallbackSystem
-                systemFallbackSound = fallback
                 sourceURL = nil
                 engine = AVAudioEngine()
                 player = AVAudioPlayerNode()
                 engineOutputFormat = engine.mainMixerNode.outputFormat(forBus: 0)
                 outputFormat = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 2)
                     ?? AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 44_100, channels: 2, interleaved: false)!
+                systemFallbackSound = fallback
                 return
             }
 
@@ -121,6 +138,7 @@ final class Clicker {
 
         engine = AVAudioEngine()
         player = AVAudioPlayerNode()
+        player.pan = 0
         engineOutputFormat = engine.mainMixerNode.outputFormat(forBus: 0)
 
         let mainMixerFormat = engine.mainMixerNode.outputFormat(forBus: 0)
@@ -136,10 +154,10 @@ final class Clicker {
                 usedSystemFallback = true
                 resolution = .fallbackSystem
                 sourceURL = nil
-                systemFallbackSound = fallback
                 outputFormat = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 2)
                     ?? AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 44_100, channels: 2, interleaved: false)!
                 FileHandle.standardError.write(Data("findphone: fallback to system sound; failed to decode \(candidate.url.path)\n".utf8))
+                systemFallbackSound = fallback
                 return
             }
             FileHandle.standardError.write(Data("findphone: cannot decode tracker audio at \(candidate.url.path)\n".utf8))
@@ -153,26 +171,6 @@ final class Clicker {
         engine.attach(player)
         engine.connect(player, to: engine.mainMixerNode, format: outputFormat)
 
-        do {
-            try engine.start()
-            engineStartCount += 1
-            player.play()
-        } catch {
-            if allowFallback, let fallback = Clicker.configureFallbackSystemSound() {
-                usedSystemFallback = true
-                resolution = .fallbackSystem
-                outputFormat = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 2)
-                    ?? AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 44_100, channels: 2, interleaved: false)!
-                systemFallbackSound = fallback
-                sourceURL = nil
-                FileHandle.standardError.write(Data("findphone: fallback to system sound; AVAudioEngine failed to start: \(error.localizedDescription)\n".utf8))
-                return
-            }
-            FileHandle.standardError.write(Data("findphone: audio engine start failed: \(error.localizedDescription)\n".utf8))
-            return nil
-        }
-
-        firstBeatFrame = AVAudioFramePosition(profile.firstBeatOffsetSeconds * outputFormat.sampleRate)
         exactFramesPerBeat = 60.0 / profile.bpm * outputFormat.sampleRate
 
         let cells = Clicker.buildBeatCells(
@@ -200,29 +198,17 @@ final class Clicker {
     func start() {
         queue.async { [weak self] in
             guard let self else { return }
-            if self.isRunning || self.isStopping { return }
-            self.isRunning = true
-            self.startSchedulers()
+            if self.usedSystemFallback {
+                self.startFallbackTimer()
+                return
+            }
+            self.startAudioPlayback()
         }
     }
 
-    func update(
-        rssi: Int?,
-        sources: Set<SignalSource> = [],
-        spectrum: [SignalSource: Int] = [:],
-        confidence: Double = 0,
-        estimate: TriangulationEstimate? = nil,
-        focusIdentity: String? = nil
-    ) {
+    func update(state: TargetAudioState) {
         queue.async { [weak self] in
-            self?.applyUpdate(
-                rssi: rssi,
-                sources: sources,
-                spectrum: spectrum,
-                confidence: confidence,
-                estimate: estimate,
-                focusIdentity: focusIdentity
-            )
+            self?.apply(state: state)
         }
     }
 
@@ -250,26 +236,27 @@ final class Clicker {
 
     // MARK: - Audio update + scheduling
 
-    private func applyUpdate(
-        rssi: Int?,
-        sources: Set<SignalSource>,
-        spectrum: [SignalSource: Int],
-        confidence: Double,
-        estimate: TriangulationEstimate?,
-        focusIdentity: String?
-    ) {
-        _ = estimate
-        if !sources.isEmpty { _ = sectorHash(from: focusIdentity) }
-        _ = spectrum
+    private func apply(state: TargetAudioState) {
+        confidence = max(0.0, min(1.0, state.confidence))
 
-        self.confidence = max(0.0, min(1.0, confidence))
-        sector = sectorHash(from: focusIdentity)
+        let now = state.lastSeen ?? Date()
 
-        let now = Date()
+        if state.identifier != activeTargetIdentity {
+            activeTargetIdentity = state.identifier
+            let resetValue = state.rssi.map(rawProximity) ?? 0.0
+            filter.reset(to: max(0.0, min(1.0, resetValue)))
+            pairHoldProximity = filter.filtered
+            let pairs = activePairs()
+            let pairCount = max(1, pairs.count)
+            requestedPairHold = profile.clampPairIndex(roundedPair(from: filter.filtered, pairCount: pairCount), pairCount: pairCount)
+            requestedPairIndex = requestedPairHold
+            pairChangeBoundaryBeat = nextPairBoundary(from: nextBeatNumber)
+            player.volume = scheduledGain()
+        }
 
-        guard let rssi else {
+        guard let rssi = state.rssi else {
             staleState = .stale
-            if let seen = lastTargetSeen {
+            if let seen = state.lastSeen ?? lastTargetSeen {
                 let age = now.timeIntervalSince(seen)
                 if age >= profile.fadingTargetWindow {
                     setIdleMode()
@@ -282,16 +269,22 @@ final class Clicker {
             return
         }
 
+        lastTargetSeen = now
+
+        let pairs = activePairs()
+        if pairs.isEmpty {
+            setIdleMode()
+            return
+        }
+
         let raw = rawProximity(from: rssi)
         let filtered = filter.update(raw: raw, now: now)
-        lastTargetSeen = now
 
         staleState = .fresh
         mode = .tracking
 
-        let pairs = activePairs()
         let pairCount = max(1, pairs.count)
-        let requested = pairCount > 1 ? Int(round(filtered * Double(pairCount - 1))) : 0
+        let requested = roundedPair(from: filtered, pairCount: pairCount)
 
         if abs(filtered - pairHoldProximity) >= profile.proximityHysteresis {
             pairHoldProximity = filtered
@@ -303,16 +296,16 @@ final class Clicker {
 
         requestedPairIndex = profile.clampPairIndex(requestedPairIndex, pairCount: pairCount)
         player.volume = scheduledGain()
-        player.pan = targetPan
     }
 
-    private var targetPan: Float {
-        let normalized = (Double(sector) / 8.0) - 0.5
-        return Float(normalized * 0.8)
+    private func roundedPair(from value: Double, pairCount: Int) -> Int {
+        guard pairCount > 1 else { return 0 }
+        let clamped = max(0.0, min(1.0, value))
+        return Int(round(clamped * Double(pairCount - 1)))
     }
 
     private func rawProximity(from rssi: Int) -> Double {
-        return (Double(rssi) - profile.proximityFarRSSI) / (profile.proximityNearRSSI - profile.proximityFarRSSI)
+        (Double(rssi) - profile.proximityFarRSSI) / (profile.proximityNearRSSI - profile.proximityFarRSSI)
     }
 
     private func setIdleMode() {
@@ -324,18 +317,37 @@ final class Clicker {
         requestedPairHold = defaultPair
         pairHoldProximity = 0
         staleState = .stale
-        nextBeatNumber = max(0, nextBeatNumber)
-        pairAdjustmentAnchorBeat = max(0, pairAdjustmentAnchorBeat)
         player.volume = scheduledGain()
     }
 
-    private func startSchedulers() {
-        if usedSystemFallback {
-            startFallbackTimer()
+    private func startAudioPlayback() {
+        if isRunning || isStopping { return }
+
+        do {
+            try engine.start()
+            engineStartCount += 1
+        } catch {
+            handleEngineStartFailure(error)
             return
         }
 
+        isRunning = true
+        fillLookAheadQueue()
+
+        guard queuedBeatCount > 0 else {
+            isRunning = false
+            return
+        }
+
+        player.play()
         startLookAheadTimer()
+        if debugEnabled {
+            logDiagnostics(force: true)
+        }
+    }
+
+    private func handleEngineStartFailure(_ error: Error) {
+        FileHandle.standardError.write(Data("findphone: audio engine start failed: \(error.localizedDescription)\n".utf8))
     }
 
     private func startLookAheadTimer() {
@@ -350,12 +362,17 @@ final class Clicker {
     }
 
     private func startFallbackTimer() {
+        guard usedSystemFallback else { return }
+
         fallbackTimer?.cancel()
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now(), repeating: profile.beatDuration)
         timer.setEventHandler { [weak self] in
             guard let self else { return }
             if self.isStopping { return }
+            if !self.isRunning {
+                self.isRunning = true
+            }
             AudioServicesPlaySystemSound(self.systemFallbackSound)
         }
         fallbackTimer = timer
@@ -366,19 +383,35 @@ final class Clicker {
         guard isRunning, !isStopping, !usedSystemFallback else { return }
         guard sourceBuffer != nil else { return }
 
+        let hadZeroQueue = queuedBeatCount == 0
+        fillLookAheadQueue()
+
+        if queuedBeatCount == 0, hadZeroQueue {
+            underrunCount += 1
+        }
+
+        updateFreshnessState()
+
+        if queuedBeatCount <= lookAheadLowWatermark && staleState == .stale {
+            if mode == .idle {
+                setIdleMode()
+            }
+        }
+    }
+
+    private func fillLookAheadQueue() {
+        guard sourceBuffer != nil else { return }
+        guard !activePairs().isEmpty else { return }
+
         while queuedBeatCount < lookAheadBeats {
-            guard let buffer = nextBeatBuffer() else { break }
+            guard let buffer = nextBeatBuffer() else { return }
 
             let beat = nextBeatNumber
-            let scheduleFrame = absoluteFrame(forBeat: beat)
-            debugScheduledSampleFrame = scheduleFrame
-            let time = AVAudioTime(sampleTime: scheduleFrame, atRate: outputFormat.sampleRate)
-
-            player.scheduleBuffer(buffer, at: time, completionCallbackType: .dataPlayedBack) { [weak self] _ in
+            player.scheduleBuffer(buffer, at: nil, options: [], completionCallbackType: .dataPlayedBack) { [weak self] _ in
                 self?.queue.async {
                     guard let self else { return }
                     self.queuedBeatCount = max(0, self.queuedBeatCount - 1)
-                    self.lastPairUpdate = max(self.lastPairUpdate, beat)
+                    self.completedBeatCount += 1
                     if self.debugEnabled {
                         let now = Date()
                         if now.timeIntervalSince(self.lastDebug) > 1.5 {
@@ -390,19 +423,12 @@ final class Clicker {
             }
 
             queuedBeatCount += 1
+            scheduledBeatCount += 1
             nextBeatNumber += 1
             schedulePairStepIfNeeded(afterBeat: beat)
-
-            let expectedEnd = scheduleFrame + AVAudioFramePosition(buffer.frameLength)
-            if expectedEnd >= AVAudioFramePosition(Int64(sourceBuffer?.frameLength ?? 0)) {
-                lateScheduleCount += 1
+            if queuedBeatCount >= lookAheadBeats {
+                break
             }
-        }
-
-        updateFreshnessState()
-
-        if queuedBeatCount < lookAheadBeats, staleState == .stale {
-            setIdleMode()
         }
     }
 
@@ -413,22 +439,58 @@ final class Clicker {
         let activeIndex = profile.clampPairIndex(currentPairIndex, pairCount: pairs.count)
         let pair = pairs[activeIndex]
         let phase = nextBeatNumber % max(1, profile.beatsPerPhrase)
-        return phase == 0 ? pair.first.buffer : pair.second.buffer
+
+        if phase == 0 {
+            return pair.first.buffer
+        }
+        return pair.second.buffer
+    }
+
+    private func nextPairBoundary(from beat: Int) -> Int {
+        return beat % profile.beatsPerPhrase == 0 ? beat + 1 : beat
     }
 
     private func schedulePairStepIfNeeded(afterBeat beat: Int) {
-        // Move the requested source pair at most once per two-beat phrase.
         guard !activePairs().isEmpty else { return }
-        if beat % 2 == 1 && beat - pairAdjustmentAnchorBeat >= 2 {
-            let target = profile.clampPairIndex(requestedPairIndex, pairCount: activePairs().count)
-            if target != currentPairIndex {
-                currentPairIndex += target > currentPairIndex ? 1 : -1
-                currentPairIndex = profile.clampPairIndex(currentPairIndex, pairCount: activePairs().count)
-                pairAdjustmentAnchorBeat = beat
-                player.volume = scheduledGain()
-                player.pan = targetPan
-            }
+        let pairCount = activePairs().count
+        let target = profile.clampPairIndex(requestedPairIndex, pairCount: pairCount)
+        let transition = Self.nextPair(
+            beat: beat,
+            requestedPair: target,
+            currentPair: currentPairIndex,
+            pairChangeBoundary: pairChangeBoundaryBeat,
+            pairCount: pairCount,
+            beatsPerPhrase: profile.beatsPerPhrase
+        )
+
+        if transition.changed {
+            currentPairIndex = transition.newCurrentPair
+            pairChangeBoundaryBeat = transition.newBoundary
         }
+        player.volume = scheduledGain()
+    }
+
+    static func nextPair(
+        beat: Int,
+        requestedPair: Int,
+        currentPair: Int,
+        pairChangeBoundary: Int,
+        pairCount: Int,
+        beatsPerPhrase: Int
+    ) -> (newCurrentPair: Int, newBoundary: Int, changed: Bool) {
+        guard pairCount > 0 else { return (currentPair, pairChangeBoundary, false) }
+        guard requestedPair != currentPair else { return (currentPair, pairChangeBoundary, false) }
+        guard beat % beatsPerPhrase == 1 else { return (currentPair, pairChangeBoundary, false) }
+        guard beat >= pairChangeBoundary else { return (currentPair, pairChangeBoundary, false) }
+
+        var next = currentPair
+        if requestedPair > currentPair {
+            next += 1
+        } else if requestedPair < currentPair {
+            next -= 1
+        }
+        let clamped = max(0, min(pairCount - 1, next))
+        return (clamped, beat + beatsPerPhrase, true)
     }
 
     private func updateFreshnessState() {
@@ -450,10 +512,6 @@ final class Clicker {
         }
     }
 
-    private func absoluteFrame(forBeat beat: Int) -> AVAudioFramePosition {
-        AVAudioFramePosition(firstBeatFrame + AVAudioFramePosition(Double(beat) * exactFramesPerBeat))
-    }
-
     private func activePairs() -> [BeatPair] {
         switch mode {
         case .tracking:
@@ -471,7 +529,55 @@ final class Clicker {
 
     static func buildBeatPairs(from cells: [BeatCell], profile: MotionTrackerAudioProfile) -> (idle: [BeatPair], tracking: [BeatPair]) {
 
+        let idleRange = profile.idleLoopBeatRange
         let trackingRange = profile.trackingRange(totalBeats: cells.count)
+
+        func classifyPair(_ first: BeatCell, _ second: BeatCell) -> (BeatCell, BeatCell) {
+            let firstEnergy = first.buffer.rmsEnergy()
+            let secondEnergy = second.buffer.rmsEnergy()
+            if firstEnergy >= secondEnergy {
+                var strong = first
+                strong = BeatCell(
+                    index: strong.index,
+                    startFrame: strong.startFrame,
+                    frameLength: strong.frameLength,
+                    accent: .strong,
+                    sourceProgress: strong.sourceProgress,
+                    buffer: strong.buffer
+                )
+                var weak = second
+                weak = BeatCell(
+                    index: weak.index,
+                    startFrame: weak.startFrame,
+                    frameLength: weak.frameLength,
+                    accent: .weak,
+                    sourceProgress: weak.sourceProgress,
+                    buffer: weak.buffer
+                )
+                return (strong, weak)
+            }
+
+            var strong = second
+            strong = BeatCell(
+                index: strong.index,
+                startFrame: strong.startFrame,
+                frameLength: strong.frameLength,
+                accent: .strong,
+                sourceProgress: strong.sourceProgress,
+                buffer: strong.buffer
+            )
+            var weak = first
+            weak = BeatCell(
+                index: weak.index,
+                startFrame: weak.startFrame,
+                frameLength: weak.frameLength,
+                accent: .weak,
+                sourceProgress: weak.sourceProgress,
+                buffer: weak.buffer
+            )
+            return (weak, strong)
+        }
+
         let pairRangeFor: (Range<Int>) -> [BeatPair] = { range in
             guard range.count >= 2 else { return [] }
             let start = max(0, range.lowerBound)
@@ -482,15 +588,19 @@ final class Clicker {
             var pairIndex = 0
             var i = start
             while i + 1 < end {
-                let first = cells[i]
-                let second = cells[i + 1]
-                let pairProgress = (first.sourceProgress + second.sourceProgress) * 0.5
+                var first = cells[i]
+                var second = cells[i + 1]
+                let pairSourceProgress = (first.sourceProgress + second.sourceProgress) * 0.5
+                let classified = classifyPair(first, second)
+                first = classified.0
+                second = classified.1
+
                 pairs.append(
                     BeatPair(
                         pairIndex: pairIndex,
                         first: first,
                         second: second,
-                        sourceProgress: pairProgress
+                        sourceProgress: pairSourceProgress
                     )
                 )
                 pairIndex += 1
@@ -499,12 +609,14 @@ final class Clicker {
             return pairs
         }
 
-        var idlePairs = pairRangeFor(profile.idleBeatRange)
-        let trackingPairs = pairRangeFor(trackingRange)
+        let idlePairs = pairRangeFor(idleRange)
 
         if idlePairs.isEmpty {
-            idlePairs = pairRangeFor(0..<max(1, cells.count))
+            return ([], pairRangeFor(trackingRange))
         }
+
+        let trackingPairs = pairRangeFor(trackingRange)
+
         if trackingPairs.isEmpty {
             return (idlePairs, idlePairs)
         }
@@ -512,19 +624,38 @@ final class Clicker {
         return (idlePairs, trackingPairs)
     }
 
-    static func buildBeatCells(from buffer: AVAudioPCMBuffer, profile: MotionTrackerAudioProfile, exactFramesPerBeat: Double) -> [BeatCell] {
+    static func buildBeatCells(
+        from buffer: AVAudioPCMBuffer,
+        profile: MotionTrackerAudioProfile,
+        exactFramesPerBeat: Double
+    ) -> [BeatCell] {
         var cells: [BeatCell] = []
 
         let totalFrames = Int(buffer.frameLength)
-        let firstBeatFrame = AVAudioFramePosition(profile.firstBeatOffsetSeconds * buffer.format.sampleRate)
-        if totalFrames <= 0 { return [] }
+        if totalFrames <= 0 {
+            return []
+        }
 
         var beatIndex = 0
         while true {
-            let start = Int((Double(firstBeatFrame) + Double(beatIndex) * exactFramesPerBeat).rounded())
-            let end = Int((Double(firstBeatFrame) + Double(beatIndex + 1) * exactFramesPerBeat).rounded())
+            let start = sourceFrame(
+                forBeat: beatIndex,
+                sampleRate: buffer.format.sampleRate,
+                profile: profile,
+                exactFramesPerBeat: exactFramesPerBeat
+            )
+            let end = sourceFrame(
+                forBeat: beatIndex + 1,
+                sampleRate: buffer.format.sampleRate,
+                profile: profile,
+                exactFramesPerBeat: exactFramesPerBeat
+            )
+
             if end > totalFrames { break }
-            if end <= start { beatIndex += 1; continue }
+            if end <= start {
+                beatIndex += 1
+                continue
+            }
 
             let length = end - start
             guard let segment = buffer.makeSegment(from: start, frameLength: length) else {
@@ -546,53 +677,25 @@ final class Clicker {
             beatIndex += 1
         }
 
-        // Infer strong/weak alternating accent by energy per pair while preserving timeline order.
-        for i in stride(from: 0, to: cells.count - 1, by: 2) {
-            if i + 1 >= cells.count { break }
-
-            let firstEnergy = cells[i].buffer.rmsEnergy()
-            let secondEnergy = cells[i + 1].buffer.rmsEnergy()
-            if firstEnergy >= secondEnergy {
-                cells[i] = BeatCell(
-                    index: cells[i].index,
-                    startFrame: cells[i].startFrame,
-                    frameLength: cells[i].frameLength,
-                    accent: .strong,
-                    sourceProgress: cells[i].sourceProgress,
-                    buffer: cells[i].buffer
-                )
-                cells[i + 1] = BeatCell(
-                    index: cells[i + 1].index,
-                    startFrame: cells[i + 1].startFrame,
-                    frameLength: cells[i + 1].frameLength,
-                    accent: .weak,
-                    sourceProgress: cells[i + 1].sourceProgress,
-                    buffer: cells[i + 1].buffer
-                )
-            } else {
-                cells[i] = BeatCell(
-                    index: cells[i].index,
-                    startFrame: cells[i].startFrame,
-                    frameLength: cells[i].frameLength,
-                    accent: .weak,
-                    sourceProgress: cells[i].sourceProgress,
-                    buffer: cells[i].buffer
-                )
-                cells[i + 1] = BeatCell(
-                    index: cells[i + 1].index,
-                    startFrame: cells[i + 1].startFrame,
-                    frameLength: cells[i + 1].frameLength,
-                    accent: .strong,
-                    sourceProgress: cells[i + 1].sourceProgress,
-                    buffer: cells[i + 1].buffer
-                )
-            }
-
-            applyFade(to: cells[i].buffer)
-            applyFade(to: cells[i + 1].buffer)
+        for cell in cells {
+            applyFade(to: cell.buffer)
         }
 
         return cells
+    }
+
+    static func sourceFrame(
+        forBeat beatIndex: Int,
+        sampleRate: Double,
+        profile: MotionTrackerAudioProfile,
+        exactFramesPerBeat: Double
+    ) -> Int {
+        Int(
+            (
+                profile.firstBeatOffsetSeconds * sampleRate
+                + Double(beatIndex) * exactFramesPerBeat
+            ).rounded()
+        )
     }
 
     private func scheduledGain() -> Float {
@@ -606,11 +709,6 @@ final class Clicker {
         let proximity = filter.filtered
         let tonalGain = 0.3 + 0.7 * proximity
         return Float(confidenceGain * freshnessGain * tonalGain)
-    }
-
-    private func sectorHash(from identity: String?) -> Int {
-        guard let identity else { return 0 }
-        return abs(identity.utf8.reduce(0) { result, byte in (result &* 31) &+ Int(byte) }) % 8
     }
 
     static func resolveAudioURL(explicitPath: String?) -> (url: URL, resolution: AudioSourceResolution)? {
@@ -681,7 +779,6 @@ final class Clicker {
         let targetCapacity = AVAudioFrameCount(max(2, Int64(ceil(requestedFrames + 32.0))))
         guard let output = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: targetCapacity) else { return nil }
 
-        var convertedFrames: AVAudioFrameCount = 0
         var sourceOffset: AVAudioFrameCount = 0
 
         let inputBlock: AVAudioConverterInputBlock = { packetCount, status in
@@ -719,8 +816,7 @@ final class Clicker {
             return nil
         }
 
-        convertedFrames = output.frameLength
-        if convertedFrames == 0 {
+        if output.frameLength == 0 {
             output.frameLength = output.frameCapacity
         }
         return output
@@ -733,6 +829,7 @@ final class Clicker {
         if !force && now.timeIntervalSince(lastDebug) < 1.5 { return }
         lastDebug = now
 
+        let d = diagnostics
         var lines: [String] = []
         lines.append("path=\(sourceURL?.path ?? "(system-fallback)")")
         if let sourceFormat {
@@ -745,16 +842,17 @@ final class Clicker {
         lines.append("beatDuration=\(String(format: "%.4f", profile.beatDuration))")
         lines.append("exactFramesPerBeat=\(String(format: "%.3f", exactFramesPerBeat))")
         lines.append("beatCells=\(beatCellCount)")
-        lines.append("idleRange=\(profile.idleBeatRange)")
+        lines.append("idleRange=\(profile.idleLoopBeatRange)")
         lines.append("trackingRange=\(profile.trackingRange(totalBeats: beatCellCount))")
-        lines.append("filteredProx=\(String(format: "%.3f", filter.filtered))")
-        lines.append("requestedPair=\(requestedPairIndex)")
-        lines.append("currentPair=\(currentPairIndex)")
-        lines.append("scheduledBeat=\(nextBeatNumber)")
-        lines.append("scheduledSample=\(debugScheduledSampleFrame)")
-        lines.append("queued=\(queuedBeatCount)")
-        lines.append("lateSchedules=\(lateScheduleCount)")
-        lines.append("engineRestarts=\(engineStartCount)")
+        lines.append("filteredProx=\(String(format: "%.3f", d.filteredProximity))")
+        lines.append("requestedPair=\(d.requestedPair)")
+        lines.append("currentPair=\(d.currentPair)")
+        lines.append("scheduledBeat=\(d.scheduledBeat)")
+        lines.append("queued=\(d.queuedBeats)")
+        lines.append("scheduledBeatCount=\(d.scheduledBeatCount)")
+        lines.append("completedBeatCount=\(d.completedBeatCount)")
+        lines.append("underruns=\(d.underrunCount)")
+        lines.append("engineRestarts=\(d.engineRestarts)")
 
         FileHandle.standardError.write(Data("[audio] \(lines.joined(separator: ", "))\n".utf8))
     }

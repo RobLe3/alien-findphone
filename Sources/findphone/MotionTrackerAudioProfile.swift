@@ -6,7 +6,9 @@ struct MotionTrackerAudioProfile {
     let firstBeatOffsetSeconds: Double = 0.058
     let beatsPerPhrase: Int = 2
 
-    let idleBeatRange: Range<Int> = 0..<15
+    let idleLoopBeatRange: Range<Int> = 0..<14
+    let transitionBeatRange: Range<Int> = 14..<15
+    let trackingStartBeat: Int = 15
     let fallbackIdlePairIndex: Int = 0
 
     let attackTau: TimeInterval = 0.20
@@ -22,9 +24,9 @@ struct MotionTrackerAudioProfile {
     var beatDuration: TimeInterval { 60.0 / bpm }
 
     func trackingRange(totalBeats: Int) -> Range<Int> {
-        let start = min(max(idleBeatRange.upperBound, 0), totalBeats)
+        let start = max(trackingStartBeat, 0)
         if start >= totalBeats {
-            return 0..<max(1, totalBeats)
+            return 0..<min(totalBeats, max(1, start))
         }
         return start..<totalBeats
     }
@@ -38,9 +40,7 @@ struct MotionTrackerAudioProfile {
 struct TargetAudioState {
     let identifier: String?
     let rssi: Int?
-    let estimatedDistanceMeters: Double?
     let confidence: Double
-    let sector: Int?
     let lastSeen: Date?
     let isLocked: Bool
 }
@@ -71,12 +71,13 @@ struct AudioBeatDiagnostics: Equatable {
     let requestedPair: Int
     let currentPair: Int
     let scheduledBeat: Int
-    let scheduledSampleTime: AVAudioFramePosition
     let queuedBeats: Int
-    let lateScheduleCount: Int
+    let underrunCount: Int
+    let scheduledBeatCount: Int
+    let completedBeatCount: Int
     let filteredProximity: Double
-    let engineRestarts: Int
     let sourcePairCount: Int
+    let engineRestarts: Int
 }
 
 final class AudioProximityFilter {
@@ -93,7 +94,7 @@ final class AudioProximityFilter {
     }
 
     func reset(to value: Double = 0.0) {
-        filtered = value
+        filtered = max(0.0, min(1.0, value))
         lastUpdated = nil
     }
 

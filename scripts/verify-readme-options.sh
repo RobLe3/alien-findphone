@@ -29,27 +29,56 @@ readme_options=$(
 )
 help_options=$(printf '%s\n' "$help_output" | grep -oE -- "--[a-zA-Z][a-zA-Z0-9-]*" | sort -u)
 
-missing=0
-
 if [ -z "$readme_options" ]; then
   echo "No long options found in README" >&2
   exit 1
 fi
+
+if [ -z "$help_options" ]; then
+  echo "No long options found in --help output" >&2
+  exit 1
+fi
+
+missing=0
 
 while IFS= read -r option; do
   if [ -z "$option" ]; then
     continue
   fi
 
-    if ! printf '%s\n' "$help_options" | grep -qx -- "$option"; then
+  if ! printf '%s\n' "$help_options" | grep -qx -- "$option"; then
     echo "README documents option '$option' but --help does not list it" >&2
     missing=1
   fi
+
 done <<< "$readme_options"
 
 if [ $missing -ne 0 ]; then
-  echo "Option documentation mismatch. README options must match --help output." >&2
+  echo "Option coverage mismatch (README -> --help)." >&2
   exit 1
 fi
 
-echo "README options are covered by --help."
+# Ensure all public long options are present in README (excluding short aliases and defaults from hidden lines)
+while IFS= read -r option; do
+  if [ -z "$option" ]; then
+    continue
+  fi
+
+  # Ignore internal test-only or non-documentable flags if they appear here.
+  if [ "$option" = "--help" ]; then
+    continue
+  fi
+
+  if ! printf '%s\n' "$readme_options" | grep -qx -- "$option"; then
+    echo "--help documents option '$option' but README does not list it" >&2
+    missing=1
+  fi
+
+done <<< "$help_options"
+
+if [ $missing -ne 0 ]; then
+  echo "Option coverage mismatch (--help -> README)." >&2
+  exit 1
+fi
+
+echo "README and --help option sets are mutually covered."

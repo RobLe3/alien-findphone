@@ -8,14 +8,16 @@ set -euo pipefail
 DEPLOYMENT_TARGET=13
 OUT="${1:-dist}"
 APP_DIR="$OUT/alien-findphone"
+BUNDLE_NAME="findphone_findphone.bundle"
 
 for arch in arm64 x86_64; do
     echo "==> building $arch"
     swift build -c release \
         --scratch-path ".build-$arch" \
         -Xswiftc -target -Xswiftc "$arch-apple-macos$DEPLOYMENT_TARGET"
- done
+done
 
+rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR"
 
 lipo -create -output "$APP_DIR/findphone" \
@@ -24,20 +26,35 @@ lipo -create -output "$APP_DIR/findphone" \
 
 bundle_source=""
 for candidate in ".build-arm64" ".build-x86_64"; do
-    found="$(find "$candidate" -name '*.bundle' -type d | head -n 1 || true)"
+    found="$({
+        find "$candidate" -type d -name "$BUNDLE_NAME" -print -quit || true
+    })"
     if [ -n "$found" ]; then
         bundle_source="$found"
         break
     fi
 done
 
-if [ -n "$bundle_source" ]; then
-    cp -R "$bundle_source" "$APP_DIR/"
-    echo "==> copied resource bundle $(basename "$bundle_source")"
-else
-    echo "warning: no target resource bundle found in release build directories"
+if [ -z "$bundle_source" ]; then
+    echo "error: required resource bundle '$BUNDLE_NAME' not found" >&2
+    exit 1
 fi
 
-chmod +x "$APP_DIR/findphone"
+cp -R "$bundle_source" "$APP_DIR/"
+
+test -f "$APP_DIR/$BUNDLE_NAME/alien_original_motion_tracker.m4a"
+
+test -x "$APP_DIR/findphone"
+if ! lipo "$APP_DIR/findphone" -verify_arch arm64; then
+    echo "error: arm64 architecture missing from universal executable" >&2
+    exit 1
+fi
+
+if ! lipo "$APP_DIR/findphone" -verify_arch x86_64; then
+    echo "error: x86_64 architecture missing from universal executable" >&2
+    exit 1
+fi
+"$APP_DIR/findphone" --help >/dev/null
+
 echo "==> built $APP_DIR/findphone"
 lipo -info "$APP_DIR/findphone"

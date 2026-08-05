@@ -195,6 +195,7 @@ findphone --list
 --anchors <path>      load an optional anchor configuration
 --audio-pack <path>   use a custom M4A tracker source
 --replace             replace an already-running detector
+--replace-existing    legacy alias for --replace
 --mute                disable tracker audio
 --no-sound            alias for --mute
 ```
@@ -204,8 +205,7 @@ Run `findphone --help` for the authoritative option list.
 
 ## Tracker audio
 
-The default audio source is loaded from the application resource bundle:
-`Sources/findphone/Resources/alien_original_motion_tracker.m4a`.
+The default audio source is loaded from the application resource bundle included with the executable.
 
 The bundled source uses an approximately:
 
@@ -214,8 +214,9 @@ The bundled source uses an approximately:
 - Alternating strong and weak pulse structure
 - Ordered tonal progression from distant to close
 
-The source is decoded once to PCM and loaded into an `AVAudioEngine` timeline.
-The same target state produces repeatable playback.
+The source is decoded once to PCM and loaded as beat-aligned buffers. These buffers
+are queued contiguously on one `AVAudioPlayerNode` timeline. A short timer keeps
+the queue near two beats deep so playback timing stays deterministic.
 
 Proximity changes select positions in the ordered source progression:
 
@@ -259,7 +260,9 @@ Diagnostics are written to standard error and may include:
 - beat-cell count
 - requested/current pair index
 - queued beats
-- scheduling drift counters
+- queue underrun count
+- scheduled beat count
+- completed beat count
 
 Disable sound through environment:
 
