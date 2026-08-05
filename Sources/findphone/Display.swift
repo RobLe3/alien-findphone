@@ -125,7 +125,7 @@ enum Display {
         }
 
         lines.append("")
-        lines.append(huntFooter(interactive: interactive, columns: columns))
+        lines.append(huntFooter(interactive: interactive, mode: mode, density: density, columns: columns))
         return lines
     }
 
@@ -185,7 +185,7 @@ enum Display {
         guard !s.assets.isEmpty else {
             lines.append("  (nothing yet — give it a few seconds)")
             lines.append("")
-            lines.append(interactive ? huntFooter(interactive: interactive, columns: columns) : "Ctrl-C to stop.")
+            lines.append(interactive ? huntFooter(interactive: interactive, mode: mode, density: density, columns: columns) : "Ctrl-C to stop.")
             return lines
         }
 
@@ -205,7 +205,7 @@ enum Display {
             ))
         }
         lines.append("")
-        lines.append(huntFooter(interactive: interactive, columns: columns))
+        lines.append(huntFooter(interactive: interactive, mode: mode, density: density, columns: columns))
         return lines
     }
 
@@ -440,22 +440,79 @@ enum Display {
         print("\nTrack one with:  findphone <name>")
     }
 
-    private static func huntFooter(interactive: Bool, columns: Int) -> String {
+    private static func huntFooter(interactive: Bool, mode: HudMode, density: TinyDensity, columns: Int) -> String {
         guard interactive else {
             return "q or Ctrl-C to stop."
         }
 
-        return menuLine(columns: columns)
+        switch mode {
+        case .wide, .standard:
+            return menuLine(
+                options: [
+                    "  MENU: up(k) / down(j), enter lock, c clear, q/ Ctrl-C to stop",
+                    "  MENU: k/j move, enter lock, c clear, q/ Ctrl-C to stop",
+                    "  MENU: [U][D]=move, [E]=lock, [C]=clear, [Q]=quit",
+                    menuSymbols(columns: columns, compact: true, density: density)
+                ],
+                columns: columns
+            )
+        case .compact:
+            return menuLine(
+                options: [
+                    "  MENU: k/j move, enter lock, c clear, q/ Ctrl-C to stop",
+                    "  MENU: [U][D] [E] [C] [Q]",
+                    menuSymbols(columns: columns, compact: true, density: density)
+                ],
+                columns: columns
+            )
+        case .tiny:
+            return menuSymbols(columns: columns, compact: true, density: density)
+        }
     }
 
-    private static func menuLine(columns: Int) -> String {
-        let options = [
-            "  MENU: up(k) / down(j), enter lock, c clear, q/ Ctrl-C to stop",
-            "  MENU: k/j move, enter lock, c clear, q/ Ctrl-C to stop",
-            "  MENU: U/D move, E lock, C clear, Q quit",
-            "[U][D][E][C][Q]"
+    private static func menuLine(options: [String], columns: Int) -> String {
+        return options.first { $0.count <= columns } ?? options.last!
+    }
+
+    private static func menuSymbols(columns: Int, compact: Bool, density: TinyDensity) -> String {
+        if compact {
+            let compactSymbols = [
+                "[U][D] [E] [C] [Q]",
+                "[U][D][E][C][Q]",
+                " U  D  E  C  Q ",
+                "U D E C Q",
+                "U D E Q",
+                "U Q"
+            ]
+            return compactSymbols.first(where: { $0.count <= columns }) ?? compactSymbols.last!
+        }
+
+        let normalSymbols = [
+            "  [U]=up [D]=down [E]=lock [C]=clear [Q]=quit",
+            "  [U][D] [E] [C] [Q]",
+            "[U][D][E][C][Q]",
+            " U  D  E  C  Q ",
+            "U D E C Q",
+            "U D E Q",
+            "U Q"
         ]
-        return options.first(where: { $0.count <= columns }) ?? "[U][D][E][C][Q]"
+        let compactSymbols = [
+            "[U][D] [E] [C] [Q]",
+            "[U][D][E][C][Q]",
+            " U  D  E  C  Q ",
+            "U D E C Q",
+            "U D E Q",
+            "U Q"
+        ]
+
+        switch density {
+        case .normal:
+            return menuLine(options: normalSymbols, columns: columns)
+        case .compact:
+            return menuLine(options: compactSymbols, columns: columns)
+        case .ultra:
+            return menuLine(options: ["[U][D] [E] [C] [Q]", "[U][D][E][C][Q]", "U/D E C Q", "U D Q", "UQ"], columns: columns)
+        }
     }
 
     private static func hudMode(_ columns: Int) -> HudMode {
