@@ -45,15 +45,11 @@ cp -R "$bundle_source" "$APP_DIR/"
 test -f "$APP_DIR/$BUNDLE_NAME/alien_original_motion_tracker.m4a"
 
 test -x "$APP_DIR/findphone"
-if ! lipo "$APP_DIR/findphone" -verify_arch arm64; then
+if ! lipo "$APP_DIR/findphone" -verify_arch arm64 x86_64; then
     echo "error: arm64 architecture missing from universal executable" >&2
     exit 1
 fi
 
-if ! lipo "$APP_DIR/findphone" -verify_arch x86_64; then
-    echo "error: x86_64 architecture missing from universal executable" >&2
-    exit 1
-fi
 "$APP_DIR/findphone" --help >/dev/null
 
 echo "==> built $APP_DIR/findphone"

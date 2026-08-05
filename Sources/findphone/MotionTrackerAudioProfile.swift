@@ -11,6 +11,11 @@ struct MotionTrackerAudioProfile {
     let trackingStartBeat: Int = 15
     let fallbackIdlePairIndex: Int = 0
 
+    let desiredToneLevelCount: Int = 8
+    let minimumToneLevelCount: Int = 5
+    let maximumToneLevelCount: Int = 12
+    let duplicateToneCents: Double = 24.0
+
     let attackTau: TimeInterval = 0.20
     let releaseTau: TimeInterval = 0.80
     let proximityHysteresis: Double = 0.04
@@ -31,9 +36,9 @@ struct MotionTrackerAudioProfile {
         return start..<totalBeats
     }
 
-    func clampPairIndex(_ value: Int, pairCount: Int) -> Int {
-        guard pairCount > 0 else { return 0 }
-        return max(0, min(pairCount - 1, value))
+    func clampToneLevel(_ value: Int, levelCount: Int) -> Int {
+        guard levelCount > 0 else { return 0 }
+        return max(0, min(levelCount - 1, value))
     }
 }
 
@@ -67,16 +72,92 @@ struct BeatPair {
     let sourceProgress: Double
 }
 
+struct ToneAnalysis {
+    let frequencyHz: Double
+    let confidence: Double
+    let rms: Double
+    let peakAmplitude: Double
+}
+
+struct TrackerToneLevel {
+    let level: Int
+    let sourcePairIndex: Int
+    let pair: BeatPair
+    let dominantFrequencyHz: Double
+    let pitchConfidence: Double
+    let normalizationGain: Float
+}
+
+struct TrackerToneBank {
+    let levels: [TrackerToneLevel]
+
+    var count: Int { levels.count }
+
+    func level(at index: Int) -> TrackerToneLevel {
+        let safe = max(0, min(levels.count - 1, index))
+        return levels[safe]
+    }
+}
+
+final class ToneLevelSelector {
+    private let levelCount: Int
+    private let hysteresis: Double
+
+    private(set) var selectedLevel: Int
+
+    init(levelCount: Int, initialLevel: Int = 0, hysteresis: Double = 0.04) {
+        self.levelCount = max(1, levelCount)
+        self.hysteresis = max(0.0, hysteresis)
+        self.selectedLevel = max(0, min(self.levelCount - 1, initialLevel))
+    }
+
+    func reset(to level: Int) {
+        selectedLevel = max(0, min(levelCount - 1, level))
+    }
+
+    func update(proximity: Double) -> Int {
+        guard levelCount > 1 else {
+            selectedLevel = 0
+            return 0
+        }
+
+        let value = max(0.0, min(1.0, proximity))
+        let divisor = Double(levelCount - 1)
+        let half = hysteresis * 0.5
+
+        while selectedLevel < levelCount - 1 {
+            let upward = (Double(selectedLevel) + 0.5) / divisor
+            if value >= upward + half {
+                selectedLevel += 1
+                continue
+            }
+            break
+        }
+
+        while selectedLevel > 0 {
+            let downward = (Double(selectedLevel) - 0.5) / divisor
+            if value <= downward - half {
+                selectedLevel -= 1
+                continue
+            }
+            break
+        }
+
+        return selectedLevel
+    }
+}
+
 struct AudioBeatDiagnostics: Equatable {
-    let requestedPair: Int
-    let currentPair: Int
+    let requestedToneLevel: Int
+    let currentToneLevel: Int
     let scheduledBeat: Int
     let queuedBeats: Int
     let underrunCount: Int
     let scheduledBeatCount: Int
     let completedBeatCount: Int
     let filteredProximity: Double
-    let sourcePairCount: Int
+    let targetToneFrequencyHz: Int
+    let tonePairIndex: Int
     let engineRestarts: Int
 }
 
@@ -88,7 +169,7 @@ final class AudioProximityFilter {
     private(set) var filtered: Double
 
     init(initial: Double = 0.0, attackTau: TimeInterval, releaseTau: TimeInterval) {
-        self.filtered = initial
+        self.filtered = max(0.0, min(1.0, initial))
         self.attackTau = max(0.001, attackTau)
         self.releaseTau = max(0.001, releaseTau)
     }
@@ -105,6 +186,7 @@ final class AudioProximityFilter {
             filtered = clamped
             return filtered
         }
+
         let dt = max(0.0, now.timeIntervalSince(previous))
         lastUpdated = now
 
@@ -114,4 +196,9 @@ final class AudioProximityFilter {
         filtered = max(0.0, min(1.0, filtered))
         return filtered
     }
+}
+
+func centsBetween(_ lower: Double, _ upper: Double) -> Double {
+    guard lower > 0 && upper > 0 else { return 0 }
+    return 1200.0 * log2(upper / lower)
 }

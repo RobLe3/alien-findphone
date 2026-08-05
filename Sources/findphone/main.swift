@@ -463,6 +463,63 @@ if interactiveSelection {
 }
 
 let drawInterval = names.isEmpty ? 1.0 : 0.25
+
+private func updateTrackerAudio(
+    from snapshot: Snapshot,
+    clicker: Clicker?
+) {
+    guard let focus = snapshot.focusAsset else {
+        clicker?.update(
+            state: TargetAudioState(
+                identifier: snapshot.selectedIdentity,
+                rssi: nil,
+                confidence: 0,
+                lastSeen: snapshot.at,
+                isLocked: snapshot.isManualTracking
+            )
+        )
+        return
+    }
+
+    let staleLock =
+        snapshot.isManualTracking
+        && snapshot.selectedIdentity != nil
+        && snapshot.selectedIdentity != focus.identity
+
+    guard !staleLock else {
+        clicker?.update(
+            state: TargetAudioState(
+                identifier: snapshot.selectedIdentity,
+                rssi: nil,
+                confidence: 0,
+                lastSeen: snapshot.at,
+                isLocked: true
+            )
+        )
+        return
+    }
+
+    let quality = focus.confidence(now: snapshot.at)
+    let confidence = snapshot.focusFresh ? quality : quality * 0.55
+
+    clicker?.update(
+        state: TargetAudioState(
+            identifier: snapshot.selectedIdentity,
+            rssi: snapshot.focusAudioRSSI,
+            confidence: confidence,
+            lastSeen: snapshot.at,
+            isLocked: snapshot.selectedIdentity == snapshot.focusAsset?.identity
+        )
+    )
+}
+
+Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { _ in
+    updateTrackerAudio(
+        from: tracker.snapshot(),
+        clicker: activeClicker
+    )
+}
+
 Timer.scheduledTimer(withTimeInterval: drawInterval, repeats: true) { _ in
     let snapshot = tracker.snapshot()
     if interactiveSelection {
@@ -472,55 +529,8 @@ Timer.scheduledTimer(withTimeInterval: drawInterval, repeats: true) { _ in
     }
 
     Display.render(snapshot, redact: redact, interactive: interactiveSelection, highlightedIdentity: selectionState.highlightedIdentity)
-
-    var shouldSound = false
-    if let focus = snapshot.focusAsset {
-        let age = snapshot.at.timeIntervalSince(focus.last)
-        shouldSound = age < 18
-        if shouldSound {
-            let staleLock = snapshot.isManualTracking
-                && snapshot.selectedIdentity != nil
-                && snapshot.selectedIdentity != focus.identity
-            if staleLock {
-                activeClicker?.update(
-                    state: TargetAudioState(
-                        identifier: snapshot.selectedIdentity,
-                        rssi: nil,
-                        confidence: 0,
-                        lastSeen: snapshot.at,
-                        isLocked: true
-                    )
-                )
-                return
-            }
-            let live = snapshot.focusLive ?? focus.bestRSSI
-            let staleQuality = focus.confidence(now: snapshot.at)
-            let confidence = snapshot.focusFresh ? staleQuality : staleQuality * 0.55
-            activeClicker?.update(
-                state: TargetAudioState(
-                    identifier: snapshot.selectedIdentity,
-                    rssi: live,
-                    confidence: confidence,
-                    lastSeen: snapshot.at,
-                    isLocked: snapshot.selectedIdentity == snapshot.focusAsset?.identity
-                )
-            )
-            return
-        }
-    }
-
-    if !shouldSound {
-        activeClicker?.update(
-            state: TargetAudioState(
-                identifier: snapshot.selectedIdentity,
-                rssi: nil,
-                confidence: 0,
-                lastSeen: snapshot.at,
-                isLocked: snapshot.isManualTracking
-            )
-        )
-    }
 }
+
 
 RunLoop.main.run()
 

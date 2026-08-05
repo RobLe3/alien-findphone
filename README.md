@@ -212,20 +212,22 @@ The bundled source uses an approximately:
 - 84.72 BPM pulse clock
 - 0.7082-second beat duration
 - Alternating strong and weak pulse structure
-- Ordered tonal progression from distant to close
+- Broad tonal progression across stable source regions
 
-The source is decoded once to PCM and loaded as beat-aligned buffers. These buffers
-are queued contiguously on one `AVAudioPlayerNode` timeline. A short timer keeps
-the queue near two beats deep so playback timing stays deterministic.
+The source is decoded once to PCM and split into beat-aligned buffers. These
+buffers are queued contiguously on one `AVAudioPlayerNode` timeline. A short timer
+keeps the queue near two beats deep so playback timing stays deterministic.
 
-Proximity changes select positions in the ordered source progression:
+The current implementation keeps the rhythm fixed at approximately 84.72 BPM and
+maps the selected target’s recent RSSI to a discrete verified tone level:
 
-```text
-target moves closer    source progression advances
-target moves farther    source progression reverses
-target remains stable   selected region remains stable
-target is lost          audio returns toward the idle region
-```
+- stronger measured RSSI -> higher tone level
+- weaker measured RSSI -> lower tone level
+- stable measured RSSI -> same tone level repeats
+- target lost -> returns toward the low tone region
+
+The same tone level is played for both beats of each two-beat phrase, and the selected
+tone level only changes at phrase boundaries.
 
 A missing source now fails loudly by default; it is not silently replaced by
 `Tink.aiff`.
@@ -258,7 +260,8 @@ Diagnostics are written to standard error and may include:
 - configured BPM
 - beat duration
 - beat-cell count
-- requested/current pair index
+- requested/current tone level
+- requested/current source pair index
 - queued beats
 - queue underrun count
 - scheduled beat count
@@ -400,7 +403,7 @@ stty sane
 - It cannot make a device ring.
 - It does not replace Find My.
 - One receiver cannot provide reliable physical bearing.
-- RSSI is a distance-like indicator, not exact distance.
+- RSSI is a proximity indicator, not a physical distance measurement.
 - Anchor estimates are coarse.
 - BLE identities can rotate or omit names.
 - Similar names and rotating BLE addresses can still require manual comparison.

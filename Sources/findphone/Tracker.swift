@@ -2,6 +2,9 @@ import Foundation
 import CoreBluetooth
 import CoreWLAN
 
+private let audioRSSIWindow: TimeInterval = 0.8
+private let audioRSSIMaxAge: TimeInterval = 1.5
+
 enum LinkState: String {
     case down = "LINK DOWN"
     case classic = "link up"
@@ -47,6 +50,24 @@ struct Snapshot {
 
     var focusLive: Int? {
         focusReadings.since(liveWindow, now: at).medianRSSI ?? focusReadings.last?.rssi
+    }
+
+    /// Short-window, target-only RSSI sample for tracker audio.
+    ///
+    /// The full bestRSSI value may retain an older reading that is no longer
+    /// representative of the selected target. This uses only readings from the
+    /// currently focused identity and a very short window.
+    var focusAudioRSSI: Int? {
+        guard let newest = focusReadings.last else {
+            return nil
+        }
+
+        guard at.timeIntervalSince(newest.at) <= audioRSSIMaxAge else {
+            return nil
+        }
+
+        let recent = focusReadings.since(audioRSSIWindow, now: at)
+        return recent.medianRSSI ?? newest.rssi
     }
 
     var focusFresh: Bool {

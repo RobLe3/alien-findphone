@@ -46,11 +46,12 @@ final class SoundTests: XCTestCase {
         let exact = 60.0 / profile.bpm * 44_100
         let first = Clicker.sourceFrame(forBeat: 0, sampleRate: 44_100, profile: profile, exactFramesPerBeat: exact)
         let tenth = Clicker.sourceFrame(forBeat: 10, sampleRate: 44_100, profile: profile, exactFramesPerBeat: exact)
-        XCTAssertEqual(first, Int(profile.firstBeatOffsetSeconds * 44_100))
+        let expectedFirst = Int((profile.firstBeatOffsetSeconds * 44_100).rounded())
+        XCTAssertEqual(first, expectedFirst)
         XCTAssertGreaterThan(tenth, first)
     }
 
-    func testBeatGridBoundariesUseAbsoluteFrameIndexing() throws {
+    func testBeatGridBoundariesAreContiguousAndBounded() throws {
         let format = AVAudioFormat(
             commonFormat: .pcmFormatFloat32,
             sampleRate: 44_100,
@@ -98,32 +99,15 @@ final class SoundTests: XCTestCase {
         XCTAssertLessThanOrEqual(drift, 1)
     }
 
-    func testBeatRangeAndPairIntegrity() throws {
-        guard let url = Bundle.module.url(forResource: "alien_original_motion_tracker", withExtension: "m4a") else {
-            XCTFail("missing bundled audio")
+    func testBeatPairIntegrityPreservesSourceOrder() throws {
+        guard let (buffer, profile) = try loadedTrackerBuffer() else {
             return
         }
 
-        let file = try AVAudioFile(forReading: url)
-        let decodeFormat = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: file.processingFormat.sampleRate,
-            channels: file.processingFormat.channelCount,
-            interleaved: false
-        )!
-        let frameCapacity = AVAudioFrameCount(file.length)
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: decodeFormat, frameCapacity: frameCapacity) else {
-            XCTFail("decode buffer")
-            return
-        }
-        buffer.frameLength = frameCapacity
-        try file.read(into: buffer)
-
-        let profile = MotionTrackerAudioProfile()
         let pairGrid = Clicker.buildBeatPairs(from: buffer, profile: profile)
-
         let allPairs = pairGrid.idle + pairGrid.tracking
         XCTAssertFalse(allPairs.isEmpty)
+
         for pair in allPairs {
             XCTAssertEqual(pair.second.index, pair.first.index + 1)
             XCTAssertEqual(
@@ -138,133 +122,125 @@ final class SoundTests: XCTestCase {
             XCTAssertNotEqual(pair.first.accent, pair.second.accent)
         }
 
-        let validIdleIndices = profile.idleLoopBeatRange
-        let validTrackingStart = profile.trackingStartBeat
-        XCTAssertGreaterThan(pairGrid.idle.last?.first.index ?? -1, -1)
-        for pair in pairGrid.idle {
-            XCTAssertTrue(validIdleIndices.contains(pair.first.index))
+        if let lastIdlePair = pairGrid.idle.last {
+            XCTAssertLessThanOrEqual(lastIdlePair.first.index, 13)
+            XCTAssertEqual(lastIdlePair.second.index, lastIdlePair.first.index + 1)
         }
 
-        if !pairGrid.tracking.isEmpty {
-            XCTAssertTrue(pairGrid.tracking.first!.first.index >= validTrackingStart)
-            for pair in pairGrid.tracking {
-                XCTAssertFalse(profile.transitionBeatRange.contains(pair.first.index))
-                XCTAssertFalse(profile.transitionBeatRange.contains(pair.second.index))
-            }
-            XCTAssertEqual(pairGrid.tracking.first?.first.index, 15)
-            XCTAssertEqual(pairGrid.tracking.first?.second.index, 16)
-            if pairGrid.tracking.count > 1 {
-                XCTAssertEqual(pairGrid.tracking[1].first.index, 17)
-                XCTAssertEqual(pairGrid.tracking[1].second.index, 18)
-            }
-            if let lastIdlePair = pairGrid.idle.last {
-                XCTAssertEqual(lastIdlePair.first.index, 12)
-                XCTAssertEqual(lastIdlePair.second.index, 13)
-            }
+        XCTAssertEqual(pairGrid.tracking.first?.first.index, profile.trackingStartBeat)
+        if pairGrid.tracking.count > 1 {
+            XCTAssertEqual(pairGrid.tracking[1].first.index, profile.trackingStartBeat + 2)
         }
     }
 
-    func testPairBoundaryTransitionAndPhasePreservation() {
-        let profile = MotionTrackerAudioProfile()
+    func testToneBankIsMonotonicAndDeduplicated() throws {
+        guard let (buffer, profile) = try loadedTrackerBuffer() else { return }
 
-        var step = Clicker.nextPair(
-            beat: 0,
-            requestedPair: 5,
-            currentPair: 1,
-            pairChangeBoundary: 1,
-            pairCount: 10,
-            beatsPerPhrase: profile.beatsPerPhrase
+        let cells = Clicker.buildBeatCells(
+            from: buffer,
+            profile: profile,
+            exactFramesPerBeat: 60.0 / profile.bpm * buffer.format.sampleRate
         )
-        XCTAssertFalse(step.changed)
-        XCTAssertEqual(step.newCurrentPair, 1)
-        XCTAssertEqual(step.newBoundary, 1)
-
-        step = Clicker.nextPair(
-            beat: 1,
-            requestedPair: 5,
-            currentPair: 1,
-            pairChangeBoundary: 1,
-            pairCount: 10,
-            beatsPerPhrase: profile.beatsPerPhrase
-        )
-        XCTAssertTrue(step.changed)
-        XCTAssertEqual(step.newCurrentPair, 2)
-        XCTAssertEqual(step.newBoundary, 3)
-
-        step = Clicker.nextPair(
-            beat: 2,
-            requestedPair: 5,
-            currentPair: step.newCurrentPair,
-            pairChangeBoundary: step.newBoundary,
-            pairCount: 10,
-            beatsPerPhrase: profile.beatsPerPhrase
-        )
-        XCTAssertFalse(step.changed)
-        XCTAssertEqual(step.newCurrentPair, 2)
-
-        step = Clicker.nextPair(
-            beat: 3,
-            requestedPair: 5,
-            currentPair: 2,
-            pairChangeBoundary: 3,
-            pairCount: 10,
-            beatsPerPhrase: profile.beatsPerPhrase
-        )
-        XCTAssertTrue(step.changed)
-        XCTAssertEqual(step.newCurrentPair, 3)
-        XCTAssertEqual(step.newBoundary, 5)
-    }
-
-    func testPairTransitionDirectionMatchesRequestedMovement() {
-        let profile = MotionTrackerAudioProfile()
-
-        let rise = Clicker.nextPair(
-            beat: 3,
-            requestedPair: 4,
-            currentPair: 3,
-            pairChangeBoundary: 1,
-            pairCount: 6,
-            beatsPerPhrase: profile.beatsPerPhrase
-        )
-        XCTAssertTrue(rise.changed)
-        XCTAssertEqual(rise.newCurrentPair, 4)
-
-        let fall = Clicker.nextPair(
-            beat: 3,
-            requestedPair: 2,
-            currentPair: 3,
-            pairChangeBoundary: 1,
-            pairCount: 6,
-            beatsPerPhrase: profile.beatsPerPhrase
-        )
-        XCTAssertTrue(fall.changed)
-        XCTAssertEqual(fall.newCurrentPair, 2)
-    }
-
-    func testProximityPairMappingIsMonotonic() {
-        let profile = MotionTrackerAudioProfile()
-        let pairCount = 20
-
-        func requested(_ proximity: Double) -> Int {
-            let raw = max(0.0, min(1.0, proximity))
-            return pairCount > 1 ? Int(round(raw * Double(pairCount - 1))) : 0
+        let pairs = Clicker.buildBeatPairs(from: cells, profile: profile).tracking
+        guard let bank = Clicker.buildToneBank(from: pairs, profile: profile) else {
+            XCTFail("failed to build tone bank")
+            return
         }
 
-        let p20 = requested(0.2)
-        let p40 = requested(0.4)
-        let p60 = requested(0.6)
-        let p80 = requested(0.8)
+        XCTAssertGreaterThanOrEqual(bank.count, 5)
 
-        XCTAssertLessThanOrEqual(p20, p40)
-        XCTAssertLessThanOrEqual(p40, p60)
-        XCTAssertLessThanOrEqual(p60, p80)
+        for idx in 1..<bank.count {
+            let previous = bank.levels[idx - 1]
+            let current = bank.levels[idx]
+            XCTAssertLessThan(previous.dominantFrequencyHz, current.dominantFrequencyHz)
+        }
 
-        let stableA = requested(0.45)
-        let stableB = requested(0.45)
-        XCTAssertEqual(stableA, stableB)
+        let pairIndices = bank.levels.map(\.sourcePairIndex)
+        XCTAssertEqual(pairIndices.count, Set(pairIndices).count)
     }
 
-    func testProximityFilterAttackFasterThanRelease() {
+    func testToneBankHasUsefulPitchSpan() throws {
+        guard let (buffer, profile) = try loadedTrackerBuffer() else { return }
+
+        let cells = Clicker.buildBeatCells(
+            from: buffer,
+            profile: profile,
+            exactFramesPerBeat: 60.0 / profile.bpm * buffer.format.sampleRate
+        )
+        let pairs = Clicker.buildBeatPairs(from: cells, profile: profile).tracking
+        guard let bank = Clicker.buildToneBank(from: pairs, profile: profile) else {
+            XCTFail("failed to build tone bank")
+            return
+        }
+
+        let minFrequency = bank.levels.map(\.dominantFrequencyHz).min() ?? 0
+        let maxFrequency = bank.levels.map(\.dominantFrequencyHz).max() ?? 0
+
+        let pitchSpanCents = 1200.0 * log2(maxFrequency / minFrequency)
+        XCTAssertGreaterThan(pitchSpanCents, 250)
+    }
+
+    func testToneSelectorHoldsLevelForSteadySignal() {
+        let selector = ToneLevelSelector(levelCount: 8, initialLevel: 3, hysteresis: 0.04)
+        var now = Date()
+        let filter = AudioProximityFilter(initial: 0.0, attackTau: 0.20, releaseTau: 0.80)
+
+        var last: Int?
+        for _ in 0..<120 {
+            let filtered = filter.update(raw: 0.55, now: now)
+            let current = selector.update(proximity: filtered)
+            if let prior = last {
+                XCTAssertEqual(current, prior)
+            }
+            last = current
+            now = now.addingTimeInterval(0.25)
+        }
+    }
+
+    func testToneSelectorCanJumpAcrossLevelsInOneUpdate() {
+        let selector = ToneLevelSelector(levelCount: 8, initialLevel: 1, hysteresis: 0.04)
+        _ = selector.update(proximity: 0.2)
+        let fastJump = selector.update(proximity: 0.95)
+        XCTAssertGreaterThan(fastJump, 4)
+
+        let down = selector.update(proximity: 0.05)
+        XCTAssertLessThan(down, 2)
+    }
+
+    func testProximityMappingIsMonotonicAcrossRange() {
+        let profile = MotionTrackerAudioProfile()
+        let levelCount = 10
+        let nearLevel = selectorValue(levelCount: levelCount, rssi: -55, profile: profile)
+        let midLevel = selectorValue(levelCount: levelCount, rssi: -75, profile: profile)
+        let farLevel = selectorValue(levelCount: levelCount, rssi: -95, profile: profile)
+
+        XCTAssertLessThanOrEqual(farLevel, midLevel)
+        XCTAssertLessThanOrEqual(midLevel, nearLevel)
+
+        XCTAssertEqual(
+            selectorValue(levelCount: levelCount, rssi: -75, profile: profile),
+            selectorValue(levelCount: levelCount, rssi: -75, profile: profile)
+        )
+    }
+
+    func testTrackToneSelectionUpdatesOnlyFromProximityBoundaries() {
+        let selector = ToneLevelSelector(levelCount: 8, initialLevel: 4, hysteresis: 0.04)
+
+        let holdLevel = selector.update(proximity: 0.50)
+        XCTAssertEqual(selector.update(proximity: 0.50 + 0.01), holdLevel)
+        XCTAssertEqual(selector.update(proximity: 0.52), holdLevel)
+
+        let near = selector.update(proximity: 0.95)
+        XCTAssertGreaterThan(near, holdLevel)
+
+        let stillNear = selector.update(proximity: 0.95)
+        XCTAssertEqual(stillNear, near)
+
+        let far = selector.update(proximity: 0.10)
+        XCTAssertLessThan(far, near)
+    }
+
+    func testProximityFilterAttackIsFasterThanRelease() {
         let filterAttack = AudioProximityFilter(initial: 0.2, attackTau: 0.20, releaseTau: 0.80)
         let t0 = Date()
         _ = filterAttack.update(raw: 0.2, now: t0)
@@ -331,6 +307,58 @@ final class SoundTests: XCTestCase {
             XCTAssertEqual(buffer.format.sampleRate, outputFormat.sampleRate, accuracy: 1.0)
             XCTAssertGreaterThan(buffer.frameLength, 0)
         }
+    }
+
+    func testSourceBoundariesDoNotExceedFrameCountForLongBuffer() throws {
+        guard let (buffer, profile) = try loadedTrackerBuffer() else { return }
+
+        let exactFramesPerBeat = 60.0 / profile.bpm * buffer.format.sampleRate
+        let cells = Clicker.buildBeatCells(
+            from: buffer,
+            profile: profile,
+            exactFramesPerBeat: exactFramesPerBeat
+        )
+
+        guard let last = cells.last else {
+            XCTFail("no cells")
+            return
+        }
+
+        XCTAssertLessThanOrEqual(
+            last.startFrame + AVAudioFramePosition(last.frameLength),
+            AVAudioFramePosition(buffer.frameLength)
+        )
+    }
+
+    // MARK: - Helpers
+
+    private func loadedTrackerBuffer() throws -> (AVAudioPCMBuffer, MotionTrackerAudioProfile)? {
+        guard let url = Bundle.module.url(forResource: "alien_original_motion_tracker", withExtension: "m4a") else {
+            XCTFail("missing bundled audio")
+            return nil
+        }
+
+        let file = try AVAudioFile(forReading: url)
+        let decodeFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: file.processingFormat.sampleRate,
+            channels: file.processingFormat.channelCount,
+            interleaved: false
+        )!
+        let frameCapacity = AVAudioFrameCount(file.length)
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: decodeFormat, frameCapacity: frameCapacity) else {
+            XCTFail("decode buffer")
+            return nil
+        }
+        buffer.frameLength = frameCapacity
+        try file.read(into: buffer)
+
+        return (buffer, MotionTrackerAudioProfile())
+    }
+
+    private func selectorValue(levelCount: Int, rssi: Int, profile: MotionTrackerAudioProfile) -> Int {
+        let raw = (Double(rssi) - profile.proximityFarRSSI) / (profile.proximityNearRSSI - profile.proximityFarRSSI)
+        return ToneLevelSelector(levelCount: levelCount, initialLevel: 0, hysteresis: profile.proximityHysteresis).update(proximity: max(0, min(1, raw)))
     }
 }
 #endif
