@@ -12,6 +12,7 @@ private let dBmSuffix = Style.wrap("   dBm", Style.dim)
 
 /// Indexed by Proximity.band, so the colour cannot drift from the label.
 private let bandTones = [Style.brightGreen, Style.green, Style.yellow, Style.amber, Style.red]
+private let sectors = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
 
 /// A Bluetooth public address is a stable hardware identifier, so it is worth
 /// hiding when the screen is being recorded.
@@ -20,6 +21,8 @@ private let maskedAddress = "••:••:••:••:••:••"
 private let assetColumn = 22
 private let sourceColumn = 24
 private let confidenceColumn = 10
+private let distanceColumn = 8
+private let sectorColumn = 4
 private let meterBarWidth = 52
 
 enum Display {
@@ -51,6 +54,12 @@ enum Display {
 
         if let est = s.estimate {
             lines.append(Style.wrap("  trilateration hint: (\(fmt(est.x)), \(fmt(est.y))) conf \(percent(est.confidence))", Style.dim))
+        }
+
+        if let focus = s.focusAsset {
+            let estimatedDistance = formatDistance(estimatedDistanceMeters(from: focus.bestRSSI))
+            let sector = sectorTag(for: focus.identity, sources: Set(focus.sources.keys))
+            lines.append("  focus: \(estimatedDistance)m · sector \(sector)")
         }
 
         lines.append("")
@@ -97,7 +106,7 @@ enum Display {
 
         lines.append("")
         lines.append(Style.wrap("  top candidates", Style.cyan))
-        lines.append("  #  \(pad("label", assetColumn)) \(pad("src", sourceColumn)) \(pad("rssi", 6)) \(pad("conf", confidenceColumn)) age")
+        lines.append("  #  \(pad("label", assetColumn)) \(pad("src", sourceColumn)) \(pad("rssi", 6)) \(pad("conf", confidenceColumn)) \(pad("dist", distanceColumn)) \(pad("sect", sectorColumn)) age")
 
         guard !s.assets.isEmpty else {
             lines.append("  (nothing yet — give it a few seconds)")
@@ -126,7 +135,10 @@ enum Display {
         let conf = percent(focus.confidence(now: at))
         let age = Int(at.timeIntervalSince(focus.last).rounded())
         let stale = age > 7 ? Style.wrap("  stale", Style.amber) : ""
-        out.append("  \(focus.label) · \(sourceTags) · conf \(conf) · age \(age)s\(stale)")
+        let distance = formatDistance(estimatedDistanceMeters(from: focus.bestRSSI))
+        let sector = sectorTag(for: focus.identity, sources: Set(focus.sources.keys))
+        out.append("  \(focus.label) · \(sourceTags) · conf \(conf)")
+        out.append("  dist \(distance)m · sector \(sector) · age \(age)s\(stale)")
 
         let sampleHistory = readings.isEmpty
             ? [Reading(rssi: focus.bestRSSI, at: focus.last, source: focus.mostRecentSource?.rawValue ?? "")] : readings
@@ -152,6 +164,7 @@ enum Display {
         out += [
             "",
             label + "   " + trend,
+            Style.wrap("\(margin)sectors: \(sectorDial(active: sectorIndex(for: focus.identity)))", Style.dim),
             "",
             margin + Style.wrap(bar(live, width: meterBarWidth, fill: "█", empty: "░"), tone),
             "",
@@ -174,6 +187,28 @@ enum Display {
         }
     }
 
+    private static func sectorIndex(for identity: String) -> Int {
+        let sum = identity.utf8.reduce(0) { acc, b in acc + Int(b) }
+        return sectors.isEmpty ? 0 : sum % sectors.count
+    }
+
+    private static func sectorTag(for identity: String, sources: Set<SignalSource>) -> String {
+        guard !sectors.isEmpty else { return "--" }
+        if !sources.isEmpty {
+            let sourceBias = sources.map(\.rawValue).joined(separator: "+")
+            return sectors[sectorIndex(for: "\(identity)|\(sourceBias)")]
+        }
+        return sectors[sectorIndex(for: identity)]
+    }
+
+    private static func sectorDial(active: Int) -> String {
+        guard !sectors.isEmpty else { return "--" }
+        let fixed = sectors.enumerated().map { idx, value in
+            idx == active % sectors.count ? "[\(value)]" : " \(value) "
+        }
+        return fixed.joined(separator: " ")
+    }
+
     private static func assetLine(i: Int, asset: TrackedAsset, now: Date, redact: Bool) -> String {
         let label = redact ? redactLabel(asset.label, maxLen: assetColumn) : pad(asset.label, assetColumn)
         let sources = asset.sources.keys
@@ -182,10 +217,12 @@ enum Display {
             .joined(separator: ",")
         let sourceSnippet = pad(String(sources.prefix(sourceColumn)), sourceColumn)
         let conf = percent(asset.confidence(now: now))
+        let distance = formatDistance(estimatedDistanceMeters(from: asset.bestRSSI))
+        let sector = sectorTag(for: asset.identity, sources: Set(asset.sources.keys))
         let stale = now.timeIntervalSince(asset.last) > 7
         let age = Int(now.timeIntervalSince(asset.last).rounded())
         let staleSuffix = stale ? "  stale" : ""
-        return "  \(pad(String(i + 1), 2)). \(label) \(sourceSnippet)  \(pad(String(asset.bestRSSI), 6))  \(pad(conf, confidenceColumn))  \(age)s\(staleSuffix)"
+        return "  \(pad(String(i + 1), 2)). \(label) \(sourceSnippet)  \(pad(String(asset.bestRSSI), 6))  \(pad(conf, confidenceColumn))  \(pad("\(distance)m", distanceColumn))  \(pad(sector, sectorColumn)) \(age)s\(staleSuffix)"
     }
 
     private static func fmt(_ v: Double) -> String {

@@ -92,3 +92,24 @@ private let sparkLevels = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█
 func sparkline(_ readings: ArraySlice<Reading>) -> String {
     readings.map { sparkLevels[Int((Proximity.fraction($0.rssi) * 7.0).rounded())] }.joined()
 }
+
+/// Approximate RSSI-to-distance conversion for on-screen distance meters.
+///
+/// This is a heuristic with limited precision. Use only trend and relative
+/// movement, not absolute coordinate accuracy.
+private let distanceModelRssiAtOneMeter = -55.0
+private let distancePathLossExponent = 2.2
+
+func estimatedDistanceMeters(from rssi: Int) -> Double {
+    let exponent = max(1.8, distancePathLossExponent)
+    let dBm = Double(rssi)
+    let ratio = (distanceModelRssiAtOneMeter - dBm) / (10.0 * exponent)
+    return max(0.15, pow(10.0, ratio))
+}
+
+func formatDistance(_ meters: Double) -> String {
+    if meters >= 1000 {
+        return String(format: "> %.1fkm", meters / 1000.0)
+    }
+    return String(format: "%.1f", meters)
+}

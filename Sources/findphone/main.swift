@@ -99,6 +99,7 @@ Timer.scheduledTimer(withTimeInterval: names.isEmpty ? 1.0 : 0.25, repeats: true
         clicker?.update(
             rssi: snapshot.focusLive,
             sources: sourceTags,
+            spectrum: snapshot.sourceDistribution,
             confidence: quality,
             estimate: snapshot.estimate
         )
