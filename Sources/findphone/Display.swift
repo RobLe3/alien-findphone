@@ -24,8 +24,8 @@ private let minAssetColumn = 10
 private let minSourceColumn = 7
 private let meterBarWidth = 52
 
-private let defaultTerminalColumns = 120
-private let defaultTerminalRows = 40
+private let defaultTerminalColumns = 80
+private let defaultTerminalRows = 24
 
 private enum HudMode: Int {
     case wide = 0, standard = 1, compact = 2, tiny = 3
@@ -125,7 +125,7 @@ enum Display {
         }
 
         lines.append("")
-        lines.append(huntFooter(interactive: interactive, mode: mode, density: density, columns: columns))
+        lines.append(huntFooter(interactive: interactive, columns: columns))
         return lines
     }
 
@@ -185,7 +185,7 @@ enum Display {
         guard !s.assets.isEmpty else {
             lines.append("  (nothing yet — give it a few seconds)")
             lines.append("")
-            lines.append(interactive ? huntFooter(interactive: interactive, mode: mode, density: density, columns: columns) : "Ctrl-C to stop.")
+            lines.append(interactive ? huntFooter(interactive: interactive, columns: columns) : "Ctrl-C to stop.")
             return lines
         }
 
@@ -205,7 +205,7 @@ enum Display {
             ))
         }
         lines.append("")
-        lines.append(huntFooter(interactive: interactive, mode: mode, density: density, columns: columns))
+        lines.append(huntFooter(interactive: interactive, columns: columns))
         return lines
     }
 
@@ -440,62 +440,22 @@ enum Display {
         print("\nTrack one with:  findphone <name>")
     }
 
-    private static func huntFooter(interactive: Bool, mode: HudMode, density: TinyDensity, columns: Int) -> String {
+    private static func huntFooter(interactive: Bool, columns: Int) -> String {
         guard interactive else {
             return "q or Ctrl-C to stop."
         }
-
-        switch mode {
-        case .wide, .standard:
-            return menuLine(
-                options: [
-                    "  MENU: up(k) / down(j), enter lock, c clear, q/ Ctrl-C to stop",
-                    "  MENU: k/j move, enter lock, c clear, q/ Ctrl-C to stop",
-                    "  MENU: [U][D]=move, [E]=lock, [C]=clear, [Q]=quit",
-                    menuSymbols(columns: columns, compact: true, density: density)
-                ],
-                columns: columns
-            )
-        case .compact:
-            return menuLine(
-                options: [
-                    "  MENU: k/j move, enter lock, c clear, q/ Ctrl-C to stop",
-                    "  MENU: [U][D] [E] [C] [Q]",
-                    menuSymbols(columns: columns, compact: true, density: density)
-                ],
-                columns: columns
-            )
-        case .tiny:
-            return menuSymbols(columns: columns, compact: true, density: density)
-        }
+        return menuLine(
+            options: [
+                "  MENU: up(k) / down(j), enter lock, c clear, q / Ctrl-C to stop",
+                "  MENU: k/j move, enter lock, c clear, q / Ctrl-C to stop",
+                "  MENU: [U][D]=move [E]=lock [C]=clear [Q]=quit",
+                menuSymbols(columns: columns)
+            ],
+            columns: columns
+        )
     }
 
-    private static func menuLine(options: [String], columns: Int) -> String {
-        return options.first { $0.count <= columns } ?? options.last!
-    }
-
-    private static func menuSymbols(columns: Int, compact: Bool, density: TinyDensity) -> String {
-        if compact {
-            let compactSymbols = [
-                "[U][D] [E] [C] [Q]",
-                "[U][D][E][C][Q]",
-                " U  D  E  C  Q ",
-                "U D E C Q",
-                "U D E Q",
-                "U Q"
-            ]
-            return compactSymbols.first(where: { $0.count <= columns }) ?? compactSymbols.last!
-        }
-
-        let normalSymbols = [
-            "  [U]=up [D]=down [E]=lock [C]=clear [Q]=quit",
-            "  [U][D] [E] [C] [Q]",
-            "[U][D][E][C][Q]",
-            " U  D  E  C  Q ",
-            "U D E C Q",
-            "U D E Q",
-            "U Q"
-        ]
+    private static func menuSymbols(columns: Int) -> String {
         let compactSymbols = [
             "[U][D] [E] [C] [Q]",
             "[U][D][E][C][Q]",
@@ -504,15 +464,16 @@ enum Display {
             "U D E Q",
             "U Q"
         ]
+        return menuLine(options: compactSymbols, columns: columns)
+    }
 
-        switch density {
-        case .normal:
-            return menuLine(options: normalSymbols, columns: columns)
-        case .compact:
-            return menuLine(options: compactSymbols, columns: columns)
-        case .ultra:
-            return menuLine(options: ["[U][D] [E] [C] [Q]", "[U][D][E][C][Q]", "U/D E C Q", "U D Q", "UQ"], columns: columns)
-        }
+    private static func menuLine(options: [String], columns: Int) -> String {
+        return options.first { fitsLine($0, columns: columns) } ?? options.last ?? ""
+    }
+    
+    private static func fitsLine(_ text: String, columns: Int) -> Bool {
+        guard columns > 0 else { return false }
+        return text.utf8.count <= columns
     }
 
     private static func hudMode(_ columns: Int) -> HudMode {
@@ -536,16 +497,20 @@ enum Display {
         var width = max(0, envCols)
         var height = max(0, envRows)
         #if canImport(Darwin)
-        if ioctl(STDOUT_FILENO, TIOCGWINSZ, &wins) == 0, wins.ws_col > 0 {
-            width = Int(wins.ws_col)
-            height = Int(wins.ws_row)
-        }
+        let fds: [Int32] = [STDOUT_FILENO, STDIN_FILENO, STDERR_FILENO]
         #else
-        if ioctl(STDOUT_FILENO, TIOCGWINSZ, &wins) == 0, wins.ws_col > 0 {
-            width = Int(wins.ws_col)
-            height = Int(wins.ws_row)
-        }
+        let fds: [Int32] = [STDOUT_FILENO, STDERR_FILENO]
         #endif
+        for fd in fds {
+            wins = winsize()
+            guard ioctlsupport(fd, wins: &wins) else { continue }
+            if wins.ws_col > 0 {
+                width = Int(wins.ws_col)
+            }
+            if wins.ws_row > 0 {
+                height = Int(wins.ws_row)
+            }
+        }
 
         if width == 0 {
             width = defaultTerminalColumns
@@ -561,13 +526,23 @@ enum Display {
             return (terminalColumns, terminalRows)
         }
         if terminalColumns > 0 {
-            return (terminalColumns, 30)
+            return (terminalColumns, defaultTerminalRows)
         }
         if terminalRows > 0 {
-            return (100, terminalRows)
+            return (defaultTerminalColumns, terminalRows)
         }
-        return (100, 30)
+        return (defaultTerminalColumns, defaultTerminalRows)
     }
+
+    #if canImport(Darwin)
+    private static func ioctlsupport(_ fd: Int32, wins: inout winsize) -> Bool {
+        return ioctl(fd, TIOCGWINSZ, &wins) == 0
+    }
+    #else
+    private static func ioctlsupport(_ fd: Int32, wins: inout winsize) -> Bool {
+        return ioctl(fd, Int32(TIOCGWINSZ), &wins) == 0
+    }
+    #endif
 
     private static func idealTrackRows(rows: Int, columns: Int, mode: HudMode, density: TinyDensity) -> Int {
         switch mode {
