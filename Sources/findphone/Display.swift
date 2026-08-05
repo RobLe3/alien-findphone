@@ -90,7 +90,7 @@ enum Display {
         }
 
         if let est = s.estimate {
-            let estimate = "trilateration: (\(fmt(est.x)), \(fmt(est.y))) conf \(percent(est.confidence)) from \(est.sources) anchors"
+            let estimate = "coarse anchor-weighted estimate: (\(fmt(est.x)), \(fmt(est.y))) conf \(percent(est.confidence)) from \(est.sources) anchors"
             lines.append(Style.wrap("  \(estimate)", Style.dim))
         }
 
@@ -156,7 +156,7 @@ enum Display {
             lines.append("  spectrum: \(spectrum)")
         }
         if let est = s.estimate {
-            lines.append("  trilateration: (\(fmt(est.x)), \(fmt(est.y))) confidence \(percent(est.confidence)) from \(est.sources) anchors")
+            lines.append("  coarse anchor-weighted estimate: (\(fmt(est.x)), \(fmt(est.y))) confidence \(percent(est.confidence)) from \(est.sources) anchors")
         }
         if let issue = s.radioIssue {
             lines.append("  \(issue)")

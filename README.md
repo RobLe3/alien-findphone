@@ -1,189 +1,485 @@
 # alien-findphone
 
-Find nearby devices using terminal signal intelligence with an alien-scan interface.
+A retro-futuristic terminal proximity scanner for finding nearby Bluetooth devices on
+macOS.
 
-Built for the case where Find My is unavailable — for example when a device is
-enrolled in MDM that disables it — but the device is still within Bluetooth
-range and you just need to know which corner of the room it is in.
+`alien-findphone` began as a fork of
+[ben-z/findphone](https://github.com/ben-z/findphone) and expands the original
+Bluetooth locator with an interactive terminal HUD, multi-source observations,
+manual target selection, optional Wi‑Fi scanning, optional anchors, and a
+beat-aligned motion-tracker audio engine.
 
-## Attribution
+The executable remains named `findphone`.
 
-This is a forked and adapted build of [ben-z/findphone](https://github.com/ben-z/findphone), with substantial additions:
+## Why it exists
 
-- Atomized m4a-based tracker audio (distance and source-aware sound shaping).
-- Multi-source scanner surface (BLE advert/link, classic link, Wi‑Fi, and anchors).
-- Expanded tracker display with source-spectrum and distance meter output.
+The tool is intended for cases where Find My is unavailable, disabled, or not
+usable, but the device is still powered on and within radio range.
 
-## Original vs forked feature comparison
+It cannot make a device ring. Instead, it helps you search by showing how the
+observed signal changes as you move.
 
-| Feature | Original `ben-z/findphone` | `alien-findphone` fork |
-| --- | --- | --- |
-| Scanner sources | BLE adverts + direct BLE link (`readRSSI`) + classic polling | BLE adverts + BLE link + classic poll + optional Wi‑Fi + optional anchors |
-| Audio layer | Minimal/legacy tracker output | Deterministic beat-grid engine from bundled `alien_original_motion_tracker.m4a` |
-| Visual UI | Compact single-mode text list | Alien-style HUD with focus meter, range bar, sparkline, and source summary |
-| Manual target selection | Device name argument only | Interactive in-terminal selection (`k/j`/arrows, Enter to lock, `c` clear) |
-| Stability/selection mode | Candidate list rendered at fixed density | Adaptive HUD with tiny/compact/standard/wide layouts based on terminal size |
-| Tracking output | Best-effort RSSI + ranking | Confidence-aware candidates, focus freshness, stale markers, and sector tagging |
-| Triangulation | Not included | Optional anchor-weighted estimate (`--anchors`) + map-like sector context |
-| Defaults | Explicit CLI defaults for each mode | Audio pack defaults to bundled `Resources/alien_original_motion_tracker.m4a` unless overridden |
+## Platform
 
-## Install
+- macOS 13 or later
+- Apple Silicon or Intel Mac
+- Swift 5.9+ when building from source
+- Bluetooth access for the terminal application
+- No third-party package dependencies
 
-Build from source locally:
+Windows and Linux are not currently supported. The scanner, audio, terminal, and
+permission layers rely on macOS frameworks.
 
-```sh
+## Main features
+
+- BLE advertisement discovery
+- Direct BLE GATT RSSI readings
+- Classic Bluetooth RSSI observations
+- Optional Wi‑Fi scanning
+- Optional configured anchors
+- Ranked multi-device candidate list
+- Interactive target selection and locking
+- Responsive terminal HUD (adaptive tiny/compact/standard/wide layouts)
+- Confidence and freshness indicators
+- Privacy redaction mode
+- Single-instance process protection
+- Explicit silent mode
+- Bundled beat-aligned tracker audio
+- Custom M4A override support
+- Universal arm64 and x86_64 release build
+
+## Original project and fork comparison
+
+| Capability | Original `ben-z/findphone` | `alien-findphone` |
+|---|---|---|
+| Primary purpose | Locate a Bluetooth device by RSSI | Interactive multi-source proximity scanner |
+| Platform | macOS | macOS |
+| Survey mode | Yes | Yes |
+| Hunt by name | Yes | Yes |
+| Paired-device list | Yes | Yes |
+| BLE advertisements | Yes | Yes |
+| Direct BLE RSSI | Yes | Yes |
+| Classic Bluetooth RSSI | Yes | Yes |
+| Wi‑Fi observations | No | Optional |
+| Configured anchors | No | Optional |
+| Multiple visible candidates | Basic list | Ranked interactive candidate list |
+| Target selection | Name argument | Name argument or interactive selection |
+| Manual lock | No | Yes |
+| Terminal interface | Single list | Adaptive retro-futuristic HUD |
+| Privacy redaction | Yes | Yes |
+| Audio | Optional synthetic behavior | Deterministic beat-grid audio |
+| Process replacement | No | `--replace` |
+| Explicit mute | Off by default | `--mute` or `--no-sound` |
+| Tests | Small baseline | Terminal and audio regression checks |
+
+## Install from a release
+
+Download the universal release archive, extract it, and keep the extracted directory
+together:
+
+```bash
+tar -xzf findphone-macos-universal.tar.gz
+xattr -dr com.apple.quarantine alien-findphone
+./alien-findphone/findphone --help
+```
+
+For installation:
+
+```bash
+mkdir -p ~/Applications
+rm -rf ~/Applications/alien-findphone
+cp -R alien-findphone ~/Applications/alien-findphone
+
+mkdir -p ~/bin
+ln -sf ~/Applications/alien-findphone/findphone ~/bin/findphone
+```
+
+Do not copy only the executable. The tracker audio is in the adjacent resource
+bundle.
+
+## Build from source
+
+```bash
 git clone https://github.com/RobLe3/alien-findphone.git
 cd alien-findphone
+
 swift build -c release
-cp .build/release/findphone ~/bin/findphone
+swift test
 ```
 
-Requires macOS 13 or later and the Swift toolchain from Xcode Command Line Tools.
+Run the built executable:
 
-## Build
-
-```sh
-swift build -c release
-cp .build/release/findphone ~/bin/findphone
+```bash
+./.build/release/findphone --help
 ```
 
-`swift build -c release` only compiles and should not play tracker audio.
-If you still hear tracking sounds during build, an older `findphone` instance is
-still running in the background.
-Use:
+Create the self-contained universal release directory:
 
-```sh
+```bash
+./scripts/build-universal.sh dist
+```
+
+Run the packaged build:
+
+```bash
+./dist/alien-findphone/findphone --help
+```
+
+## Basic use
+
+Survey nearby candidates:
+
+```bash
+findphone
+```
+
+Track one device by name:
+
+```bash
+findphone iphone
+```
+
+List paired Bluetooth devices:
+
+```bash
+findphone --list
+```
+
+Run without Wi‑Fi scanning:
+
+```bash
+findphone --no-wifi
+```
+
+Run silently:
+
+```bash
+findphone --mute
+```
+
+Replace a detector process that is already running:
+
+```bash
 findphone --replace
 ```
-to replace the stale process before you rebuild/run again.
 
-For hands-on dev where you don't want any audio feedback, use:
+Combine options:
 
-```sh
+```bash
 findphone --mute --replace --no-wifi
 ```
 
-or:
+## Interactive controls
 
-```sh
+| Input | Action |
+|---|---|
+| Up arrow or `k` | Move highlight up |
+| Down arrow or `j` | Move highlight down |
+| Enter | Lock the highlighted candidate |
+| `c` | Clear the manual lock |
+| `q` | Quit |
+| Ctrl-C | Quit and restore terminal state |
+
+## Command-line options
+
+```text
+findphone
+findphone <name>
+findphone --list
+
+--help, -h            show help
+--redact              mask Bluetooth addresses
+--sound               legacy audio-enabling alias
+--wifi                force-enable Wi‑Fi scanning
+--no-wifi             disable Wi‑Fi scanning
+--anchors <path>      load an optional anchor configuration
+--audio-pack <path>   use a custom M4A tracker source
+--replace             replace an already-running detector
+--mute                disable tracker audio
+--no-sound            alias for --mute
+```
+
+Run `findphone --help` for the authoritative option list.
+
+
+## Tracker audio
+
+The default audio source is loaded from the application resource bundle:
+`Sources/findphone/Resources/alien_original_motion_tracker.m4a`.
+
+The bundled source uses an approximately:
+
+- 84.72 BPM pulse clock
+- 0.7082-second beat duration
+- Alternating strong and weak pulse structure
+- Ordered tonal progression from distant to close
+
+The source is decoded once to PCM and loaded into an `AVAudioEngine` timeline.
+The same target state produces repeatable playback.
+
+Proximity changes select positions in the ordered source progression:
+
+```text
+target moves closer    source progression advances
+target moves farther    source progression reverses
+target remains stable   selected region remains stable
+target is lost          audio returns toward the idle region
+```
+
+A missing source now fails loudly by default; it is not silently replaced by
+`Tink.aiff`.
+
+A custom M4A source can be used with:
+
+```bash
+findphone --audio-pack /absolute/path/to/custom.m4a
+```
+
+An explicit environment override is also supported:
+
+```bash
+ALIEN_FINDPHONE_AUDIO_FILE=/absolute/path/to/custom.m4a findphone
+```
+
+### Audio debugging
+
+Enable audio diagnostics:
+
+```bash
+ALIEN_FINDPHONE_AUDIO_DEBUG=1 findphone --replace --no-wifi
+```
+
+Diagnostics are written to standard error and may include:
+
+- Resolved source path
+- source format
+- duration
+- configured BPM
+- beat duration
+- beat-cell count
+- requested/current pair index
+- queued beats
+- scheduling drift counters
+
+Disable sound through environment:
+
+```bash
 export ALIEN_FINDPHONE_MUTE=1
-findphone --replace --no-wifi
+findphone
 ```
 
-Requires the Swift toolchain from Xcode Command Line Tools. No dependencies.
+## Handling several devices in one room
 
-## Use
+Survey mode displays multiple nearby candidates rather than forcing an immediate name
+match.
 
-```sh
-findphone            # survey mode: nearby Wi‑Fi + BLE candidates
-findphone iphone     # hunt mode: track one device by name (defaulting to on-screen alien GUI + audio)
-findphone --list     # paired devices and their addresses
+Use the keyboard to highlight a candidate and press Enter to lock it:
+
+1. Start in survey mode.
+2. Select a candidate.
+3. Move several steps.
+4. Watch and listen for a consistent signal trend.
+5. Lock the candidate that responds consistently.
+6. Press `c` to clear the lock and test another candidate.
+
+This helps in crowded environments, but it does not automatically prove which
+physical device belongs to which person.
+
+## Signal sources
+
+The scanner can present observations from several sources.
+
+### Direct BLE link
+
+After a BLE connection is established, CoreBluetooth can request fresh RSSI
+measurements.
+
+### BLE advertisements
+
+Nearby BLE advertisements are observed passively.
+
+### Classic Bluetooth
+
+Paired-device information and cached RSSI values are read through:
+
+```text
+system_profiler SPBluetoothDataType
 ```
 
-In interactive terminal mode, use up/down (or j/k) and Enter to lock a highlighted
-candidate, and `c` to clear manual lock.
-The menu is now adaptive: in wide terminals it mirrors the classic full-width
-menu format and collapses to compact symbols on narrow terminals.
+macOS can retain the same value for several polling cycles.
 
-Hunt mode defaults to the alien GUI and motion-tracker sound from the bundled
-default audio pack (`alien_original_motion_tracker.m4a`) using the deterministic
-beat timeline.
-Survey mode also starts the tracker output so nearby stable assets get a continuous
-distance-aware feed automatically.
+### Wi‑Fi
 
-(`--audio-pack` can always override this default. `ALIEN_FINDPHONE_AUDIO_FILE`
-can also provide an explicit environment override.)
-`--sound` remains a legacy alias in this fork and force-enables the same tracker.
+CoreWLAN can optionally add nearby Wi‑Fi observations.
 
-Add `--redact` if you are recording the screen. It masks Bluetooth addresses.
+Wi‑Fi networks are separate radio observations and are not automatically proven to be
+the same physical device as BLE candidates.
 
-Two things stay visible deliberately: the name you typed in hunt mode, and the
-names in `--list`, because picking a target means reading them. `--list` is
-not safe to film even with `--redact`.
+Disable Wi‑Fi input with:
 
-Walk slowly and watch the bar. The reading is signal strength in dBm, which is
-negative and closer to zero when nearer:
+```bash
+findphone --no-wifi
+```
 
-| dBm     | Rough meaning          |
-|---------|------------------------|
-| -45 up  | arm's reach            |
-| -60     | same table             |
-| -72     | same room              |
-| -85     | far, or behind cover   |
-| below   | very far, or shielded  |
+### Configured anchors
 
-Signal strength is a coarse proxy for distance. Metal, walls and human bodies
-attenuate it heavily, so a device in a filing cabinet two metres away can read
-the same as one fifteen metres away in open air. Trust the trend as you move,
-not any single number.
+An optional JSON file can define known anchors:
 
-## How it works
+```bash
+findphone --anchors ./anchors.json
+```
 
-Four sources feed the scanner surface, in descending order of directness:
+Where implemented, anchor coordinates provide a **coarse anchor-weighted estimate**,
+not true triangulation.
 
-1. **GATT link** — once connected to the device over BLE, `readRSSI()` returns
-   a fresh measurement about three times a second. This is the good one.
-2. **BLE advertisements** — passively observed. Apple devices rotate their
-   advertising addresses roughly every fifteen minutes and only include the
-   device name on occasional packets, so this source is sparse.
-3. **Wi‑Fi scans** — nearby access-point RSSI and SSID observations.
-4. **Classic link RSSI** — read from `system_profiler SPBluetoothDataType`,
-   keyed by the stable public address of a paired device.
+## Understanding RSSI
 
-Source 4 has a trap worth knowing about: macOS refreshes that value only every
-three to twelve seconds and serves a cached number in between. Polling it
-faster does not yield more information. Measured over 112 polls at 0.4s, every
-poll returned a value but the same value repeated for runs of 8 to 31 polls.
-The tool therefore counts a measurement only when the value actually changes,
-which is why the reported measurement count is far lower than the poll rate —
-and honest.
+RSSI is reported in dBm. Values are negative, and values closer to zero normally
+indicate stronger signal.
+
+- `-45 dBm` or stronger: Very close
+- Around `-60 dBm`: Nearby
+- Around `-72 dBm`: Often in same room
+- Around `-85 dBm`: Weak/intermittent
+- Below `-90 dBm`: Very weak or obstructed
+
+These values are rough estimates only. Walls, furniture, enclosures, body position,
+and interference affect readings significantly.
+
+## Privacy
+
+Use redaction when recording the terminal:
+
+```bash
+findphone --redact
+```
+
+Redaction masks Bluetooth addresses where supported.
 
 ## Permissions
 
-Needs Bluetooth access for whichever terminal runs it, under
-System Settings > Privacy & Security > Bluetooth. It will say so if missing.
+The terminal application requires Bluetooth permission:
+
+```text
+System Settings > Privacy & Security > Bluetooth
+```
+
+Wi‑Fi scanning may depend on local permissions and version behavior.
+
+## Process protection
+
+Only one normal detector instance should run at a time.
+
+Starting another instance while one is active reports the conflict.
+
+Replace the existing process deliberately:
+
+```bash
+findphone --replace
+```
+
+## Terminal behavior
+
+Interactive input uses non-canonical, non-echoing keyboard mode while preserving
+terminal output flags.
+
+The application restores the original terminal settings when it exits normally or
+via supported termination signals.
+
+If a terminal is interrupted externally and remains misconfigured, restore it with:
+
+```bash
+stty sane
+```
 
 ## Limitations
 
-- Cannot make a device ring. There is no path to that without Find My.
-- Cannot give a bearing. One radio yields distance only, not direction.
-- Triangulation is coarse and only as good as configured anchors/cell geometry.
-- Only finds devices with Bluetooth powered on and in range, roughly 10-20 m
-  indoors and much less through walls.
+- It cannot make a device ring.
+- It does not replace Find My.
+- One receiver cannot provide reliable physical bearing.
+- RSSI is a distance-like indicator, not exact distance.
+- Anchor estimates are coarse.
+- BLE identities can rotate or omit names.
+- Similar names and rotating BLE addresses can still require manual comparison.
+- Wi‑Fi and Bluetooth observations are not automatic identity fusion.
+- The current implementation is macOS-only.
 
-## Scanner options
+## Development checks
 
-```sh
-findphone --wifi        # force-enable Wi‑Fi (default: enabled)
-findphone --no-wifi     # disable Wi‑Fi input
-findphone --anchors     # path to JSON anchor file with optional coordinates
-findphone --audio-pack  # optional custom m4a pack for hunt audio (defaults to bundled Resources/alien_original_motion_tracker.m4a)
-findphone --replace     # stop any existing detector process and start fresh
-findphone --mute        # keep tracker silent
-findphone --no-sound    # alias for --mute
+Run the full local verification:
+
+```bash
+swift package clean
+swift build
+swift test
+swift build -c release
+git diff --check
 ```
 
-You can also set `ALIEN_FINDPHONE_MUTE=1` for the same silent behavior.
+Run noninteractive smoke checks:
 
-## Interactive controls
+```bash
+./.build/release/findphone --help
+./.build/release/findphone --list
+```
 
-- `k` / up-arrow: move highlight up
-- `j` / down-arrow: move highlight down
-- `Enter`: lock to highlighted target
-- `c`: clear manual lock
-- `q`: quit
+Run a quiet interactive smoke test:
 
-In narrow terminals (`tiny` HUD), the controls are rendered as compact symbols:
-`[↑][↓]` `↵` `c` `q` on a single menu line.
+```bash
+./.build/release/findphone --mute --replace --no-wifi
+```
 
-## Performance notes
+Run with audio diagnostics:
 
-- Use release builds for regular use (smoother rendering, tighter timer cadence):
+```bash
+ALIEN_FINDPHONE_AUDIO_DEBUG=1 \
+./.build/release/findphone --replace --no-wifi
+```
 
-  ```sh
-  swift build -c release
-  ```
+## Project structure
 
-- Audio is decoded to a signed PCM beat grid once at startup (stable 84.72 BPM
-  timeline), then scheduled deterministically from target proximity and pair
-  progression.
+```text
+Sources/findphone/
+├── main.swift
+├── Tracker.swift
+├── Signal.swift
+├── SignalRegistry.swift
+├── WiFiScanner.swift
+├── Classic.swift
+├── Display.swift
+├── Style.swift
+├── BigText.swift
+├── Sound.swift
+├── MotionTrackerAudioProfile.swift
+├── Resources/
+│   └── alien_original_motion_tracker.m4a
+
+Tests/findphoneTests/
+├── SoundTests.swift
+├── TerminalSelectionControllerTests.swift
+
+scripts/
+├── build-universal.sh
+└── verify-readme-options.sh
+
+.github/workflows/
+└── ci.yml
+└── release.yml
+```
+
+The exact file split may evolve as the implementation changes.
+
+## Attribution
+
+This project is forked from
+[ben-z/findphone](https://github.com/ben-z/findphone).
+
+The original project established the macOS Bluetooth scanning, survey, hunt,
+redaction, and proximity-locator foundation.
+
+This fork adds interactive HUD, expanded source fusion, manual selection/locking,
+process controls, and the beat-aligned tracker audio system.
+
+## License
+
+See the repository license.

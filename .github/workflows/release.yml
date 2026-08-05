@@ -16,16 +16,28 @@ jobs:
 
       - name: Build universal binary
         run: ./scripts/build-universal.sh dist
+      - name: Verify builds and tests
+        run: |
+          swift build
+          swift test
+          swift build -c release
+          git diff --check
+
+      - name: Verify release executable
+        run: |
+          dist/alien-findphone/findphone --help
+          test -x dist/alien-findphone/findphone
+          test -d dist/alien-findphone/findphone_findphone.bundle
 
       - name: Smoke test
-        run: ./dist/findphone --help
+        run: |
+          ./dist/alien-findphone/findphone --help
+          ./dist/alien-findphone/findphone --list
 
       - name: Package
         run: |
-          cp README.md dist/
-          cp -R detector_asssets dist/
-          tar -czf findphone-macos-universal.tar.gz -C dist findphone README.md
-          tar --append --file=findphone-macos-universal.tar.gz -C dist detector_asssets
+          cp README.md dist/alien-findphone/
+          tar -C dist -czf findphone-macos-universal.tar.gz alien-findphone
           shasum -a 256 findphone-macos-universal.tar.gz | tee checksums.txt
 
       - name: Publish release
@@ -38,8 +50,8 @@ jobs:
             Clearing that is the third line:
 
                 tar -xzf findphone-macos-universal.tar.gz
-                xattr -dr com.apple.quarantine findphone
-                ./findphone --help
+                xattr -dr com.apple.quarantine alien-findphone
+                ./alien-findphone/findphone --help
 
             Needs Bluetooth permission for whichever terminal runs it, under
             System Settings > Privacy & Security > Bluetooth.

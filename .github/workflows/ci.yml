@@ -13,24 +13,43 @@ jobs:
 
       - name: Build universal binary
         run: ./scripts/build-universal.sh dist
+      - name: Verify debug build
+        run: swift build
+      - name: Verify tests
+        run: swift test
+      - name: Verify release build
+        run: swift build -c release
+      - name: Verify patch cleanliness
+        run: git diff --check
+
+      - name: Verify README option coverage
+        run: ./scripts/verify-readme-options.sh
+
+      - name: Run release binary check
+        run: dist/alien-findphone/findphone --help
+
+      - name: Verify resource bundle is present in archive staging directory
+        run: |
+          test -d dist/alien-findphone/findphone_findphone.bundle
+          ls dist/alien-findphone/findphone_findphone.bundle
 
       - name: Smoke test
         run: |
-          ./dist/findphone --help
-          ./dist/findphone --list
+          dist/alien-findphone/findphone --help
+          dist/alien-findphone/findphone --list
 
       - name: Reject invalid usage
         run: |
-          if ./dist/findphone --bogus >/dev/null 2>&1; then
+          if dist/alien-findphone/findphone --bogus >/dev/null 2>&1; then
             echo "expected a non-zero exit for an unknown flag"; exit 1
           fi
-          ./dist/findphone --bogus 2>&1 | grep -q "unknown option '--bogus'"
-          ./dist/findphone one two 2>&1 | grep -q "expected one device name"
-          test -z "$(./dist/findphone --bogus 2>/dev/null)"
+          dist/alien-findphone/findphone --bogus 2>&1 | grep -q "unknown option '--bogus'"
+          dist/alien-findphone/findphone one two 2>&1 | grep -q "expected one device name"
+          test -z "$(dist/alien-findphone/findphone --bogus 2>/dev/null)"
 
       - name: Upload binary
         uses: actions/upload-artifact@v7
         with:
           name: findphone-macos-universal
-          path: dist/findphone
+          path: dist/alien-findphone
           if-no-files-found: error

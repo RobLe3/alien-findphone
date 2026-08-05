@@ -285,13 +285,15 @@ findphone — locate a nearby Bluetooth device by signal strength
   c               clear manual lock
   q               quit immediately
 
-  --sound              legacy alias; distance tone is on by default in hunt mode
+  --help, -h            show help
+  --sound              legacy alias; audio is enabled by default unless muted
   --redact             mask Bluetooth addresses, for screen recording
   --wifi               force-enable Wi‑Fi scanning
   --no-wifi            disable Wi‑Fi scanning
   --anchors <path>     path to optional anchors.json
   --audio-pack <path>  optional path to an m4a tracker sound pack. If omitted, uses bundled "alien_original_motion_tracker.m4a" unless ALIEN_FINDPHONE_AUDIO_FILE overrides it.
   --replace            replace any already-running detector instance
+  --replace-existing   legacy alias for --replace
   --mute               run without tracker sound (audio disabled)
   --no-sound           alias for --mute
 """
