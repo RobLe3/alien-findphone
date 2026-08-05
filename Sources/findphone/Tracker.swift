@@ -28,6 +28,8 @@ struct Snapshot {
     let potentialAssets: [TrackedAsset]
     let sourceDistribution: [SignalSource: Int]
     let deviceCount: Int
+    let selectedIdentity: String?
+    let isManualTracking: Bool
     let estimate: TriangulationEstimate?
     let focusAsset: TrackedAsset?
     let focusReadings: [Reading]
@@ -76,6 +78,7 @@ final class Tracker: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     private var liveLink = false
     private var linkUp = false
     private var assets: [String: TrackedAsset] = [:]
+    private var selectedIdentity: String?
 
     private let lock = NSLock()
     private var isLive: Bool { lock.withLock { liveLink } }
@@ -103,6 +106,7 @@ final class Tracker: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 
     func snapshot() -> Snapshot {
         let now = Date()
+        let selectedIdentity = lock.withLock { self.selectedIdentity }
         let snapshotAssets = lock.withLock {
             assets.values.sorted {
                 let a = $0.confidence(now: now)
@@ -116,10 +120,16 @@ final class Tracker: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         let potential = snapshotAssets.filter { $0.confidence(now: now) >= 0.28 && $0.isFresh(at: now) }
 
         let (focus, focusReadings): (TrackedAsset?, [Reading]) = lock.withLock {
-            let selected = primaryAsset(from: potential.isEmpty ? snapshotAssets : potential)
+            var selected = primaryAsset(from: potential.isEmpty ? snapshotAssets : potential)
+            if let selectedIdentity {
+                selected = snapshotAssets.first { $0.identity == selectedIdentity }
+                    ?? potential.first { $0.identity == selectedIdentity }
+                    ?? selected
+            }
             let readingHistory = selected.flatMap { perAssetReadings[$0.identity] } ?? []
             return (selected, readingHistory)
         }
+        let manualTracking = selectedIdentity != nil && snapshotAssets.contains(where: { $0.identity == selectedIdentity })
 
         var sourceCounts: [SignalSource: Int] = [:]
         for asset in snapshotAssets {
@@ -141,10 +151,18 @@ final class Tracker: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             potentialAssets: potential,
             sourceDistribution: sourceCounts,
             deviceCount: snapshotAssets.count,
+            selectedIdentity: selectedIdentity,
+            isManualTracking: manualTracking,
             estimate: estimate(now: now),
             focusAsset: focus,
             focusReadings: focusReadings
         )
+    }
+
+    func setManualFocus(identity: String?) {
+        lock.withLock {
+            selectedIdentity = identity
+        }
     }
 
     private func startWiFiScan() {

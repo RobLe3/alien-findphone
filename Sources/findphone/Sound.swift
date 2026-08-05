@@ -66,7 +66,6 @@ final class Clicker {
     private var latestRssiBand = 2
     private var token = 0
     private var lastSources: Set<SignalSource> = []
-    private var lastInterval: TimeInterval = 0
     private var latestConfidence: Double = 0
     private var latestEstimate: TriangulationEstimate?
     private var latestSpectrum: [SignalSource: Int] = [:]
@@ -179,11 +178,8 @@ final class Clicker {
         let band = bandIndex(for: rawRSSI)
         let mode = mode(for: band, confidence: confidence, sources: sources, spectrum: spectrum)
         let previousMode = currentMode
-        let previousSpectrum = latestSpectrum
 
         let changedMode = previousMode != mode
-        let changedSources = lastSources != sources
-        let changedSpectrum = previousSpectrum != spectrum
 
         latestConfidence = confidence
         latestEstimate = estimate
@@ -196,10 +192,10 @@ final class Clicker {
         let profile = profile(for: mode, band: band, sources: sources, spectrum: spectrum, confidence: confidence)
         applyProfile(profile)
 
-        if changedMode || changedSources || changedSpectrum {
+        if changedMode {
             token += 1
             scheduleAtomLoop(interval: profile.interval)
-        } else if timer == nil || abs(lastInterval - profile.interval) > 0.06 {
+        } else if timer == nil {
             scheduleAtomLoop(interval: profile.interval)
         }
     }
@@ -209,10 +205,9 @@ final class Clicker {
         timer?.invalidate()
 
         let current = token
-        let jittered = jitter(interval)
-        lastInterval = jittered
+        let steady = max(0.08, interval)
 
-        timer = Timer.scheduledTimer(withTimeInterval: jittered, repeats: false) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: steady, repeats: false) { [weak self] _ in
             guard let self else { return }
             guard self.currentMode != nil else { return }
             guard self.token == current else { return }
@@ -261,41 +256,6 @@ final class Clicker {
         pitchUnit?.rate = profile.rate
         reverbUnit?.wetDryMix = profile.reverb
         player.play()
-
-        if mode == .lock, Bool.random(), Bool.random() {
-            emitDoubleTick(after: 0.06)
-        }
-    }
-
-    private func emitDoubleTick(after delay: TimeInterval) {
-        guard player != nil, let file = audioFile else { return }
-        guard let mode = currentMode else { return }
-
-        let next = timerMode(for: mode)
-        guard let atom = atomWindow(for: next, band: latestRssiBand, spectrum: latestSpectrum) else { return }
-        let length = max(1, min(atom.count, AVAudioFrameCount(file.length - atom.start)))
-
-        DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [weak self] in
-            guard let self else { return }
-            guard self.currentMode == mode else { return }
-            let profile = self.currentProfile()
-            self.player?.scheduleSegment(file, startingFrame: atom.start, frameCount: length, at: nil)
-            if let profile {
-                self.player?.pan = profile.pan
-                self.player?.volume = max(0, profile.volume - 0.04)
-            }
-            self.player?.play()
-        }
-    }
-
-    private func timerMode(for mode: TrackerMode) -> TrackerMode {
-        switch mode {
-        case .lock: return .lock
-        case .track: return Bool.random() ? .lock : .track
-        case .survey: return .track
-        case .anchor: return .anchor
-        case .fallback: return .track
-        }
     }
 
     private func emitFallbackAtom() {
@@ -314,20 +274,17 @@ final class Clicker {
         let sourceProfile = sourceProfileModifier(for: sources)
         let spectrumProfile = spectrumProfileModifier(for: spectrum)
 
-        let conf = max(0.0, min(1.0, confidence))
-
-        var interval = base.interval
-        interval = interval * (0.90 - conf * 0.24 + (1.0 - conf) * 0.20)
-        interval = interval * (1.0 + Double(max(0, band - 2)) * 0.12)
-
-        let confidenceGain = 0.05 + (0.55 * conf)
+        let interval = base.interval
         let sectorPan = sectorPan(distance: latestDistanceEstimate(), identity: nil)
 
-        let pitch = base.pitch + sourceProfile.pitch + spectrumProfile.pitch
-        let rate = max(0.85, min(1.12, base.rate * sourceProfile.rate * spectrumProfile.rate))
+        let proximityBandBoost = Float(4 - min(4, band)) * 0.06
+        let proximityRateBoost = Float(1.0 + 0.05 * Double(max(0, 4 - band)))
+
+        let pitch = base.pitch + sourceProfile.pitch + spectrumProfile.pitch + proximityBandBoost
+        let rate = max(0.85, min(1.12, base.rate * sourceProfile.rate * spectrumProfile.rate * proximityRateBoost))
         let pan = max(-1.0, min(1.0, base.pan + sourceProfile.pan + spectrumProfile.pan + sectorPan))
         let reverb = max(0.0, min(20.0, base.reverb + sourceProfile.reverb + spectrumProfile.reverb))
-        let volume = Float(max(0.06, min(0.9, Double(base.volume) + Double(sourceProfile.volume) + Double(spectrumProfile.volume) + confidenceGain * 0.08)))
+        let volume = Float(max(0.06, min(0.9, Double(base.volume) + Double(sourceProfile.volume) + Double(spectrumProfile.volume) + 0.02)))
 
         return SoundProfile(
             interval: interval,
@@ -371,11 +328,11 @@ final class Clicker {
         case .survey:
             return SoundProfile(interval: 1.05, pitch: 0, rate: 1.0, pan: -0.10, reverb: 4, volume: 0.09)
         case .track:
-            return SoundProfile(interval: 0.58, pitch: 1, rate: 1.0, pan: 0.00, reverb: 7, volume: 0.14)
+            return SoundProfile(interval: 0.52, pitch: 1, rate: 1.0, pan: 0.00, reverb: 7, volume: 0.14)
         case .lock:
-            return SoundProfile(interval: 0.33, pitch: 2, rate: 1.01, pan: 0.04, reverb: 10, volume: 0.20)
+            return SoundProfile(interval: 0.52, pitch: 2, rate: 1.01, pan: 0.04, reverb: 10, volume: 0.20)
         case .anchor:
-            return SoundProfile(interval: 0.42, pitch: 3, rate: 1.00, pan: -0.02, reverb: 9, volume: 0.17)
+            return SoundProfile(interval: 0.52, pitch: 3, rate: 1.00, pan: -0.02, reverb: 9, volume: 0.17)
         case .fallback:
             return SoundProfile(interval: 0.75, pitch: 0, rate: 1.0, pan: 0.0, reverb: 6, volume: 0.12)
         }
@@ -950,11 +907,6 @@ final class Clicker {
         if rssi <= -75 { return 2 }
         if rssi <= -65 { return 3 }
         return 4
-    }
-
-    private func jitter(_ interval: TimeInterval) -> TimeInterval {
-        let jitter = Double.random(in: 0.92...1.14)
-        return max(0.08, interval * jitter)
     }
 
     private func stop() {
