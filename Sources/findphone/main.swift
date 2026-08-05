@@ -160,7 +160,7 @@ final class TerminalSelectionController {
         guard isatty(STDIN_FILENO) == 1 else { return }
 
         originalState = currentTerminalState()
-        configureRawMode()
+        configureInteractiveInputMode()
 
         stdin.readabilityHandler = { [weak self] handle in
             guard let self else { return }
@@ -248,15 +248,9 @@ final class TerminalSelectionController {
         return state
     }
 
-    private func configureRawMode() {
-        guard var state = originalState else { return }
-        state.c_lflag &= ~tcflag_t(ECHO | ICANON | ISIG | IEXTEN)
-        state.c_iflag &= ~tcflag_t(BRKINT | ICRNL | INPCK | ISTRIP | IXON | IXOFF)
-        state.c_oflag &= ~tcflag_t(OPOST)
-        withUnsafeMutableBytes(of: &state.c_cc) { raw in
-            raw[raw.index(raw.startIndex, offsetBy: Int(VMIN))] = 0
-            raw[raw.index(raw.startIndex, offsetBy: Int(VTIME))] = 1
-        }
+    private func configureInteractiveInputMode() {
+        guard let original = originalState else { return }
+        var state = makeInteractiveInputMode(from: original)
         _ = tcsetattr(STDIN_FILENO, TCSAFLUSH, &state)
     }
 
@@ -265,6 +259,17 @@ final class TerminalSelectionController {
         _ = tcsetattr(STDIN_FILENO, TCSAFLUSH, &state)
         originalState = nil
     }
+}
+
+func makeInteractiveInputMode(from original: termios) -> termios {
+    var state = original
+    state.c_lflag &= ~tcflag_t(ECHO | ICANON | ISIG | IEXTEN)
+    state.c_iflag &= ~tcflag_t(BRKINT | ICRNL | INPCK | ISTRIP | IXON | IXOFF)
+    withUnsafeMutableBytes(of: &state.c_cc) { raw in
+        raw[raw.index(raw.startIndex, offsetBy: Int(VMIN))] = 0
+        raw[raw.index(raw.startIndex, offsetBy: Int(VTIME))] = 1
+    }
+    return state
 }
 
 let usage = """
