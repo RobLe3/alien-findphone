@@ -19,13 +19,13 @@ This is a forked and adapted build of [ben-z/findphone](https://github.com/ben-z
 | Feature | Original `ben-z/findphone` | `alien-findphone` fork |
 | --- | --- | --- |
 | Scanner sources | BLE adverts + direct BLE link (`readRSSI`) + classic polling | BLE adverts + BLE link + classic poll + optional Wi‑Fi + optional anchors |
-| Audio layer | Minimal/legacy tracker output | Default `alien_original_motion_tracker.m4a` atomized by distance band/spectrum/manual lock state |
-| Visual UI | Compact single-mode text list | Alien-style HUD with focus meter, range bar, sparkline, sector view, and source spectrum |
+| Audio layer | Minimal/legacy tracker output | Deterministic beat-grid engine from bundled `alien_original_motion_tracker.m4a` |
+| Visual UI | Compact single-mode text list | Alien-style HUD with focus meter, range bar, sparkline, and source summary |
 | Manual target selection | Device name argument only | Interactive in-terminal selection (`k/j`/arrows, Enter to lock, `c` clear) |
 | Stability/selection mode | Candidate list rendered at fixed density | Adaptive HUD with tiny/compact/standard/wide layouts based on terminal size |
 | Tracking output | Best-effort RSSI + ranking | Confidence-aware candidates, focus freshness, stale markers, and sector tagging |
 | Triangulation | Not included | Optional anchor-weighted estimate (`--anchors`) + map-like sector context |
-| Defaults | Explicit CLI defaults for each mode | Audio pack defaults to `detector_asssets/alien_original_motion_tracker.m4a` unless overridden |
+| Defaults | Explicit CLI defaults for each mode | Audio pack defaults to bundled `Resources/alien_original_motion_tracker.m4a` unless overridden |
 
 ## Install
 
@@ -85,13 +85,14 @@ candidate, and `c` to clear manual lock.
 The menu is now adaptive: in wide terminals it mirrors the classic full-width
 menu format and collapses to compact symbols on narrow terminals.
 
-Hunt mode defaults to the alien GUI and motion-tracker sound from the default
-audio pack (`detector_asssets/alien_original_motion_tracker.m4a`), split into 5
-RSSI bands.
+Hunt mode defaults to the alien GUI and motion-tracker sound from the bundled
+default audio pack (`alien_original_motion_tracker.m4a`) using the deterministic
+beat timeline.
 Survey mode also starts the tracker output so nearby stable assets get a continuous
 distance-aware feed automatically.
 
-(`--audio-pack` can always override this default.)
+(`--audio-pack` can always override this default. `ALIEN_FINDPHONE_AUDIO_FILE`
+can also provide an explicit environment override.)
 `--sound` remains a legacy alias in this fork and force-enables the same tracker.
 
 Add `--redact` if you are recording the screen. It masks Bluetooth addresses.
@@ -156,7 +157,7 @@ System Settings > Privacy & Security > Bluetooth. It will say so if missing.
 findphone --wifi        # force-enable Wi‑Fi (default: enabled)
 findphone --no-wifi     # disable Wi‑Fi input
 findphone --anchors     # path to JSON anchor file with optional coordinates
-findphone --audio-pack  # path to custom m4a pack for hunt audio (defaults to detector_asssets/alien_original_motion_tracker.m4a)
+findphone --audio-pack  # optional custom m4a pack for hunt audio (defaults to bundled Resources/alien_original_motion_tracker.m4a)
 findphone --replace     # stop any existing detector process and start fresh
 findphone --mute        # keep tracker silent
 findphone --no-sound    # alias for --mute
@@ -183,6 +184,6 @@ In narrow terminals (`tiny` HUD), the controls are rendered as compact symbols:
   swift build -c release
   ```
 
-- Audio atoms are discovered once at startup, then reused in memory; only mode,
-  spectrum and confidence changes alter scheduling. This keeps runtime updates
-  small and stable.
+- Audio is decoded to a signed PCM beat grid once at startup (stable 84.72 BPM
+  timeline), then scheduled deterministically from target proximity and pair
+  progression.

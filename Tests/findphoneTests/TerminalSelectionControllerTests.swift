@@ -1,7 +1,6 @@
+#if canImport(Darwin) && canImport(XCTest)
 import Foundation
 import Darwin
-
-#if canImport(XCTest)
 import XCTest
 @testable import findphone
 

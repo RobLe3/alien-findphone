@@ -290,7 +290,7 @@ findphone — locate a nearby Bluetooth device by signal strength
   --wifi               force-enable Wi‑Fi scanning
   --no-wifi            disable Wi‑Fi scanning
   --anchors <path>     path to optional anchors.json
-  --audio-pack <path>  use custom m4a tracker sound pack (default: detector_asssets/alien_original_motion_tracker.m4a)
+  --audio-pack <path>  optional path to an m4a tracker sound pack. If omitted, uses bundled "alien_original_motion_tracker.m4a" unless ALIEN_FINDPHONE_AUDIO_FILE overrides it.
   --replace            replace any already-running detector instance
   --mute               run without tracker sound (audio disabled)
   --no-sound           alias for --mute
@@ -405,7 +405,7 @@ if names.count > 1 {
 let redact = options.contains("--redact")
 let enableWiFi = !options.contains("--no-wifi")
 let anchorPath = values["--anchors"]
-let audioPath = resolveAudioPackPath(values["--audio-pack"])
+let audioPath = values["--audio-pack"].map { ($0 as NSString).expandingTildeInPath }
 let replaceExisting = options.contains("--replace") || options.contains("--replace-existing")
 let silentMode = options.contains("--mute") || options.contains("--no-sound") || isAudioMutedByDefault()
 
@@ -428,8 +428,6 @@ if let clicker = activeClicker {
     clicker.start()
 } else if silentMode {
     FileHandle.standardError.write(Data("findphone: sound disabled (start with --mute to force quiet mode).\n".utf8))
-} else if FileManager.default.fileExists(atPath: audioPath) {
-    FileHandle.standardError.write(Data("findphone: could not open tracker audio at \(audioPath)\n".utf8))
 } else {
     FileHandle.standardError.write(Data("findphone: tracker audio not available, using silent mode\n".utf8))
 }
@@ -508,27 +506,6 @@ Timer.scheduledTimer(withTimeInterval: drawInterval, repeats: true) { _ in
 
 RunLoop.main.run()
 
-
-func defaultAudioPackPath() -> String {
-    let cwd = FileManager.default.currentDirectoryPath
-    let executableDir = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().deletingLastPathComponent().path
-    let candidates = [
-        "\(cwd)/detector_asssets/alien_original_motion_tracker.m4a",
-        "\(NSHomeDirectory())/development/findphone/detector_asssets/alien_original_motion_tracker.m4a",
-        "\(executableDir)/detector_asssets/alien_original_motion_tracker.m4a",
-        "\(cwd)/detector_asssets/audio.m4a",
-        "\(NSHomeDirectory())/development/findphone/detector_asssets/audio.m4a",
-        "\(executableDir)/detector_asssets/audio.m4a",
-        Bundle.main.bundlePath + "/../Resources/detector_asssets/audio.m4a"
-    ]
-    return candidates.first { FileManager.default.fileExists(atPath: $0) } ?? candidates[0]
-}
-
-func resolveAudioPackPath(_ explicit: String?) -> String {
-    guard let path = explicit else { return defaultAudioPackPath() }
-    let expanded = (path as NSString).expandingTildeInPath
-    return expanded
-}
 
 private func isAudioMutedByDefault() -> Bool {
     let env = ProcessInfo.processInfo.environment

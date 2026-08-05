@@ -2,166 +2,210 @@ import Foundation
 import AVFoundation
 import AudioToolbox
 
-/// Distance/location feedback driven by short atoms extracted from the detector pack.
-/// The focus is on preserving the original pack tone while introducing
-/// deterministic motion (survey → hunt → lock) and spectrum-aware selection.
+private let legacySystemFallbackPath = "/System/Library/Sounds/Tink.aiff"
+private let audioResourceName = "alien_original_motion_tracker"
+private let audioDebugEnv = "ALIEN_FINDPHONE_AUDIO_DEBUG"
+private let audioFileOverrideEnv = "ALIEN_FINDPHONE_AUDIO_FILE"
+private let audioFallbackEnv = "ALIEN_FINDPHONE_ALLOW_SYSTEM_SOUND_FALLBACK"
+
+enum AudioSourceResolution {
+    case explicitPath(String)
+    case overrideEnv(String)
+    case bundled
+    case missing
+    case fallbackSystem
+}
+
+enum TrackerAudioMode {
+    case tracking
+    case idle
+}
+
+enum TargetFreshness {
+    case fresh
+    case fading
+    case stale
+}
+
 final class Clicker {
-    private struct SoundProfile {
-        let interval: TimeInterval
-        let pitch: Float
-        let rate: Float
-        let pan: Float
-        let reverb: Float
-        let volume: Float
-    }
+    private let profile = MotionTrackerAudioProfile()
+    private let queue = DispatchQueue(label: "findphone.audio", qos: .userInteractive)
+    private let engine: AVAudioEngine
+    private let player: AVAudioPlayerNode
+    private let engineOutputFormat: AVAudioFormat
 
-    private struct AtomWindow {
-        let start: AVAudioFramePosition
-        let count: AVAudioFrameCount
-        let energy: Float
-        let pitchHz: Float
-        let duration: TimeInterval
-        let toneClass: ToneClass
-        let rms: Float
-    }
+    private let debugEnabled: Bool
+    private var lastDebug = Date.distantPast
 
-    private enum ToneClass: Int, CaseIterable {
-        case short = 0
-        case mid = 1
-        case long = 2
-    }
+    private var outputFormat: AVAudioFormat
+    private var sourceFormat: AVAudioFormat?
+    private var sourceBuffer: AVAudioPCMBuffer?
+    private(set) var sourceURL: URL?
+    private var exactFramesPerBeat: Double = 0
+    private var firstBeatFrame: AVAudioFramePosition = 0
+    private(set) var beatCellCount: Int = 0
+    private(set) var resolution: AudioSourceResolution = .missing
 
-    private enum TrackerMode: Int, CaseIterable {
-        case survey = 0
-        case track = 1
-        case lock = 2
-        case anchor = 3
-        case fallback = 4
+    private var idlePairs: [BeatPair] = []
+    private var trackingPairs: [BeatPair] = []
 
-        var id: Int { rawValue }
-    }
+    private var currentPairIndex = 0
+    private var requestedPairIndex = 0
+    private var requestedPairHold = 0
+    private var pairHoldProximity = 0.0
+    private var nextBeatNumber = 0
+    private var queuedBeatCount = 0
+    private var pairAdjustmentAnchorBeat = 0
 
-    private enum PitchBand: Int, CaseIterable {
-        case low = 0
-        case mid = 1
-        case high = 2
-    }
+    private var mode: TrackerAudioMode = .idle
+    private var staleState: TargetFreshness = .stale
+    private var isRunning = false
+    private var isStopping = false
+    private var lookAheadTimer: DispatchSourceTimer?
+    private var fallbackTimer: DispatchSourceTimer?
+    private let lookAheadBeats = 4
+    private let lookAheadInterval: TimeInterval = 0.08
+    private var debugScheduledSampleFrame: AVAudioFramePosition = 0
 
-    private let distant = -95.0
+    private var filter: AudioProximityFilter
+    private var lastTargetSeen: Date?
+    private var confidence = 0.0
+    private var sector = 0
+    private var lastPairUpdate: Int = 0
 
-    private var player: AVAudioPlayerNode?
-    private var pitchUnit: AVAudioUnitTimePitch?
-    private var reverbUnit: AVAudioUnitReverb?
-    private var engine: AVAudioEngine?
-    private var audioFile: AVAudioFile?
+    private var engineStartCount = 0
+    private var lateScheduleCount = 0
 
-    private var atomWindows: [AtomWindow] = []
-    private var atomByBand: [PitchBand: [AtomWindow]] = [:]
-    private var atomByMode: [TrackerMode: [AtomWindow]] = [:]
+    private var usedSystemFallback = false
+    private var systemFallbackSound: SystemSoundID = 0
 
-    private var cursorByMode: [Int: Int] = [:]
+    init?(path: String? = nil) {
+        debugEnabled = {
+            let value = ProcessInfo.processInfo.environment[audioDebugEnv]?.lowercased() ?? ""
+            return value == "1" || value == "true"
+        }()
 
-    private var timer: Timer?
-    private var currentMode: TrackerMode?
-    private var latestRssiBand = 2
-    private var token = 0
-    private var lastSources: Set<SignalSource> = []
-    private var latestConfidence: Double = 0
-    private var latestEstimate: TriangulationEstimate?
-    private var latestSpectrum: [SignalSource: Int] = [:]
-    private var latestSector = 0
+        outputFormat = AVAudioFormat(
+            standardFormatWithSampleRate: 44_100,
+            channels: 2
+        ) ?? AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 44_100, channels: 2, interleaved: false)!
+        sourceBuffer = nil
 
-    private var fallback: SystemSoundID = 0
-    private var fallbackAvailable = false
+        filter = AudioProximityFilter(attackTau: profile.attackTau, releaseTau: profile.releaseTau)
 
-    private let minPitchHz: Float = 650
-    private let maxPitchHz: Float = 3200
+        let allowFallback = {
+            let value = ProcessInfo.processInfo.environment[audioFallbackEnv]?.lowercased() ?? ""
+            return value == "1" || value == "true"
+        }()
 
-    init?(path: String = "/System/Library/Sounds/Tink.aiff") {
-        if FileManager.default.fileExists(atPath: path), setupAudioEngine(filePath: path) {
-            return
-        }
+        guard let candidate = Clicker.resolveAudioURL(explicitPath: path) else {
+            if allowFallback, let fallback = Clicker.configureFallbackSystemSound() {
+                usedSystemFallback = true
+                resolution = .fallbackSystem
+                systemFallbackSound = fallback
+                sourceURL = nil
+                engine = AVAudioEngine()
+                player = AVAudioPlayerNode()
+                engineOutputFormat = engine.mainMixerNode.outputFormat(forBus: 0)
+                outputFormat = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 2)
+                    ?? AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 44_100, channels: 2, interleaved: false)!
+                return
+            }
 
-        guard FileManager.default.fileExists(atPath: "/System/Library/Sounds/Tink.aiff"),
-              AudioServicesCreateSystemSoundID(
-                  URL(fileURLWithPath: "/System/Library/Sounds/Tink.aiff") as CFURL,
-                  &fallback
-              ) == kAudioServicesNoError
-        else {
+            FileHandle.standardError.write(Data("findphone: tracker audio source not available\n".utf8))
             return nil
         }
-        fallbackAvailable = true
-    }
 
-    deinit {
-        timer?.invalidate()
-        timer = nil
-        player?.stop()
-        if let engine {
-            engine.stop()
+        sourceURL = candidate.url
+        resolution = candidate.resolution
+
+        engine = AVAudioEngine()
+        player = AVAudioPlayerNode()
+        engineOutputFormat = engine.mainMixerNode.outputFormat(forBus: 0)
+
+        let mainMixerFormat = engine.mainMixerNode.outputFormat(forBus: 0)
+        let desiredOutput = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: max(mainMixerFormat.sampleRate, 1.0),
+            channels: AVAudioChannelCount(max(1, min(2, Int(mainMixerFormat.channelCount)))),
+            interleaved: false
+        ) ?? mainMixerFormat
+
+        guard let decoded = Clicker.decodeAudioFile(at: candidate.url, decodeTo: desiredOutput) else {
+            if allowFallback, let fallback = Clicker.configureFallbackSystemSound() {
+                usedSystemFallback = true
+                resolution = .fallbackSystem
+                sourceURL = nil
+                systemFallbackSound = fallback
+                outputFormat = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 2)
+                    ?? AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 44_100, channels: 2, interleaved: false)!
+                FileHandle.standardError.write(Data("findphone: fallback to system sound; failed to decode \(candidate.url.path)\n".utf8))
+                return
+            }
+            FileHandle.standardError.write(Data("findphone: cannot decode tracker audio at \(candidate.url.path)\n".utf8))
+            return nil
         }
-        player = nil
-        pitchUnit = nil
-        reverbUnit = nil
-        engine = nil
-        if fallback != 0 {
-            AudioServicesDisposeSystemSoundID(fallback)
-        }
-    }
 
-    private func setupAudioEngine(filePath: String) -> Bool {
-        let file: AVAudioFile
-        do {
-            file = try AVAudioFile(forReading: URL(fileURLWithPath: filePath))
-        } catch {
-            return false
-        }
-
-        let format = file.processingFormat
-        let engine = AVAudioEngine()
-        let player = AVAudioPlayerNode()
-        let pitch = AVAudioUnitTimePitch()
-        let reverb = AVAudioUnitReverb()
-
-        reverb.loadFactoryPreset(.smallRoom)
-        reverb.wetDryMix = 6
-        pitch.overlap = 8
-        pitch.pitch = 0
-        pitch.rate = 1
+        sourceBuffer = decoded
+        sourceFormat = decoded.format
+        outputFormat = decoded.format
 
         engine.attach(player)
-        engine.attach(pitch)
-        engine.attach(reverb)
-
-        engine.connect(player, to: pitch, format: format)
-        engine.connect(pitch, to: reverb, format: format)
-        engine.connect(reverb, to: engine.mainMixerNode, format: format)
+        engine.connect(player, to: engine.mainMixerNode, format: outputFormat)
 
         do {
             try engine.start()
+            engineStartCount += 1
+            player.play()
         } catch {
-            return false
+            if allowFallback, let fallback = Clicker.configureFallbackSystemSound() {
+                usedSystemFallback = true
+                resolution = .fallbackSystem
+                outputFormat = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 2)
+                    ?? AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 44_100, channels: 2, interleaved: false)!
+                systemFallbackSound = fallback
+                sourceURL = nil
+                FileHandle.standardError.write(Data("findphone: fallback to system sound; AVAudioEngine failed to start: \(error.localizedDescription)\n".utf8))
+                return
+            }
+            FileHandle.standardError.write(Data("findphone: audio engine start failed: \(error.localizedDescription)\n".utf8))
+            return nil
         }
 
-        player.play()
-        let discovered = discoverAtoms(in: file, sampleRate: format.sampleRate)
+        firstBeatFrame = AVAudioFramePosition(profile.firstBeatOffsetSeconds * outputFormat.sampleRate)
+        exactFramesPerBeat = 60.0 / profile.bpm * outputFormat.sampleRate
 
-        self.player = player
-        self.pitchUnit = pitch
-        self.reverbUnit = reverb
-        self.engine = engine
-        self.audioFile = file
-        self.atomWindows = discovered
-        self.atomByBand = buildAtomByBand(discovered)
-        self.atomByMode = buildAtomByMode(discovered)
-        return true
+        let cells = Clicker.buildBeatCells(
+            from: decoded,
+            profile: profile,
+            exactFramesPerBeat: exactFramesPerBeat
+        )
+        beatCellCount = cells.count
+        let grid = Clicker.buildBeatPairs(from: cells, profile: profile)
+        idlePairs = grid.idle
+        trackingPairs = grid.tracking
+
+        setIdleMode()
+        filter.reset(to: 0.0)
+
+        if debugEnabled {
+            logDiagnostics(force: true)
+        }
+    }
+
+    deinit {
+        stop()
     }
 
     func start() {
-        // Sound is now driven by focus updates.
+        queue.async { [weak self] in
+            guard let self else { return }
+            if self.isRunning || self.isStopping { return }
+            self.isRunning = true
+            self.startSchedulers()
+        }
     }
 
-    /// Update atom scheduler from the focused signal state.
     func update(
         rssi: Int?,
         sources: Set<SignalSource> = [],
@@ -170,754 +214,612 @@ final class Clicker {
         estimate: TriangulationEstimate? = nil,
         focusIdentity: String? = nil
     ) {
-        guard let rawRSSI = rssi else {
-            stop()
-            return
-        }
-
-        let band = bandIndex(for: rawRSSI)
-        let mode = mode(for: band, confidence: confidence, sources: sources, spectrum: spectrum)
-        let previousMode = currentMode
-
-        let changedMode = previousMode != mode
-
-        latestConfidence = confidence
-        latestEstimate = estimate
-        latestSpectrum = spectrum
-        latestSector = sectorIndex(for: focusIdentity)
-        latestRssiBand = band
-        lastSources = sources
-        currentMode = mode
-
-        let profile = profile(for: mode, band: band, sources: sources, spectrum: spectrum, confidence: confidence)
-        applyProfile(profile)
-
-        if changedMode {
-            token += 1
-            scheduleAtomLoop(interval: profile.interval)
-        } else if timer == nil {
-            scheduleAtomLoop(interval: profile.interval)
-        }
-    }
-
-    private func scheduleAtomLoop(interval: TimeInterval) {
-        guard currentMode != nil else { return }
-        timer?.invalidate()
-
-        let current = token
-        let steady = max(0.08, interval)
-
-        timer = Timer.scheduledTimer(withTimeInterval: steady, repeats: false) { [weak self] _ in
-            guard let self else { return }
-            guard self.currentMode != nil else { return }
-            guard self.token == current else { return }
-
-            self.emitAtom()
-            self.scheduleAtomLoop(interval: self.currentInterval())
-        }
-    }
-
-    private func emitAtom() {
-        guard let player = player else {
-            emitFallbackAtom()
-            return
-        }
-        guard let file = audioFile else {
-            emitFallbackAtom()
-            return
-        }
-        guard let mode = currentMode, let profile = currentProfile() else {
-            emitFallbackAtom()
-            return
-        }
-
-        if player.isPlaying {
-            player.stop()
-        }
-
-        guard let atom = atomWindow(for: mode, band: latestRssiBand, spectrum: latestSpectrum) else {
-            emitFallbackAtom()
-            return
-        }
-
-        let start = atom.start
-        let length = atom.count
-        if length == 0 || start >= file.length {
-            emitFallbackAtom()
-            return
-        }
-
-        let cappedLength = max(1, min(length, AVAudioFrameCount(file.length - start)))
-        player.scheduleSegment(file, startingFrame: start, frameCount: cappedLength, at: nil)
-        player.volume = profile.volume
-        player.pan = profile.pan
-
-        pitchUnit?.pitch = profile.pitch
-        pitchUnit?.rate = profile.rate
-        reverbUnit?.wetDryMix = profile.reverb
-        player.play()
-    }
-
-    private func emitFallbackAtom() {
-        guard fallbackAvailable else { return }
-        AudioServicesPlaySystemSound(fallback)
-    }
-
-    private func profile(
-        for mode: TrackerMode,
-        band: Int,
-        sources: Set<SignalSource>,
-        spectrum: [SignalSource: Int],
-        confidence: Double
-    ) -> SoundProfile {
-        let base = baseProfile(for: mode)
-        let sourceProfile = sourceProfileModifier(for: sources)
-        let spectrumProfile = spectrumProfileModifier(for: spectrum)
-
-        let interval = base.interval
-        let sectorPan = sectorPan(distance: latestDistanceEstimate(), identity: nil)
-
-        let proximityBandBoost = Float(4 - min(4, band)) * 0.06
-        let proximityRateBoost = Float(1.0 + 0.05 * Double(max(0, 4 - band)))
-
-        let pitch = base.pitch + sourceProfile.pitch + spectrumProfile.pitch + proximityBandBoost
-        let rate = max(0.85, min(1.12, base.rate * sourceProfile.rate * spectrumProfile.rate * proximityRateBoost))
-        let pan = max(-1.0, min(1.0, base.pan + sourceProfile.pan + spectrumProfile.pan + sectorPan))
-        let reverb = max(0.0, min(20.0, base.reverb + sourceProfile.reverb + spectrumProfile.reverb))
-        let volume = Float(max(0.06, min(0.9, Double(base.volume) + Double(sourceProfile.volume) + Double(spectrumProfile.volume) + 0.02)))
-
-        return SoundProfile(
-            interval: interval,
-            pitch: pitch,
-            rate: rate,
-            pan: pan,
-            reverb: reverb,
-            volume: volume
-        )
-    }
-
-    private func currentProfile() -> SoundProfile? {
-        guard let mode = currentMode else { return nil }
-        return profile(
-            for: mode,
-            band: latestRssiBand,
-            sources: lastSources,
-            spectrum: latestSpectrum,
-            confidence: latestConfidence
-        )
-    }
-
-    private func applyProfile(_ profile: SoundProfile) {
-        pitchUnit?.pitch = profile.pitch
-        pitchUnit?.rate = profile.rate
-        reverbUnit?.wetDryMix = profile.reverb
-        player?.pan = profile.pan
-        player?.volume = profile.volume
-    }
-
-    private func currentInterval() -> TimeInterval {
-        guard let mode = currentMode else { return 1.0 }
-        guard let profile = currentProfile() else {
-            return baseProfile(for: mode).interval
-        }
-        return profile.interval
-    }
-
-    private func baseProfile(for mode: TrackerMode) -> SoundProfile {
-        switch mode {
-        case .survey:
-            return SoundProfile(interval: 1.05, pitch: 0, rate: 1.0, pan: -0.10, reverb: 4, volume: 0.09)
-        case .track:
-            return SoundProfile(interval: 0.52, pitch: 1, rate: 1.0, pan: 0.00, reverb: 7, volume: 0.14)
-        case .lock:
-            return SoundProfile(interval: 0.52, pitch: 2, rate: 1.01, pan: 0.04, reverb: 10, volume: 0.20)
-        case .anchor:
-            return SoundProfile(interval: 0.52, pitch: 3, rate: 1.00, pan: -0.02, reverb: 9, volume: 0.17)
-        case .fallback:
-            return SoundProfile(interval: 0.75, pitch: 0, rate: 1.0, pan: 0.0, reverb: 6, volume: 0.12)
-        }
-    }
-
-    private func sourceProfileModifier(for sources: Set<SignalSource>) -> SoundProfile {
-        var pitch: Float = 0
-        var rate: Float = 1
-        var pan: Float = 0
-        var reverb: Float = 0
-        var volume: Float = 0
-
-        if sources.contains(.wifi) {
-            pitch += 1
-            rate *= 1.02
-            pan -= 0.04
-            reverb += 0.5
-            volume += 0.01
-        }
-
-        if sources.contains(.bleAdvert) {
-            pan += 0.01
-            volume += 0.008
-        }
-
-        if sources.contains(.bleLink) {
-            pan += 0.03
-            volume += 0.009
-        }
-
-        if sources.contains(.classic) {
-            pitch += 1
-            pan += 0.03
-            reverb += 0.4
-            volume += 0.01
-        }
-
-        if sources.contains(.anchor) {
-            pitch += 1
-            pan -= 0.02
-            reverb += 0.6
-            volume += 0.01
-        }
-
-        return SoundProfile(interval: 0, pitch: pitch, rate: rate, pan: pan, reverb: reverb, volume: volume)
-    }
-
-    private func spectrumProfileModifier(for spectrum: [SignalSource: Int]) -> SoundProfile {
-        let total = spectrum.values.reduce(0, +)
-        let distinct = spectrum.count
-        let weighted = max(0.0, min(1.0, Double(total) / 24.0))
-        let diversity = max(0.0, min(1.0, Double(distinct) / 6.0))
-
-        let pan = Float((weighted - 0.5) * 0.08)
-        let reverb = Float(diversity * 1.8 + weighted * 1.2)
-        let pitch = Float(weighted * 1.8 + diversity * 1.2)
-        let rate = Float(0.99 + (weighted * 0.05) + (diversity * 0.02))
-
-        let volume: Float
-        if total > 14 {
-            volume = 0.01
-        } else if total > 8 {
-            volume = 0.006
-        } else {
-            volume = 0
-        }
-
-        return SoundProfile(interval: 0, pitch: pitch, rate: rate, pan: pan, reverb: reverb, volume: volume)
-    }
-
-    private func sectorIndex(for identity: String?) -> Int {
-        guard let identity else { return 0 }
-        return abs(identity.utf8.reduce(0, { $0 + Int($1) })) % 8
-    }
-
-    private func sectorPan(distance: Double, identity: String?) -> Float {
-        _ = distance
-        let index = latestSector
-        return Float((Double(index) / 8.0) - 0.5) * 0.55
-    }
-
-    private func latestDistanceEstimate() -> Double {
-        guard let conf = latestEstimate else { return 15 }
-        let x = sqrt(conf.x * conf.x + conf.y * conf.y)
-        return max(0.0, x)
-    }
-
-    private func mode(for band: Int, confidence: Double, sources: Set<SignalSource>, spectrum: [SignalSource: Int]) -> TrackerMode {
-        let sourceCount = spectrum.values.reduce(0, +)
-        if sources.contains(.anchor) || sourceCount >= 5 {
-            return .anchor
-        }
-        if band <= 1 { return .survey }
-        if band == 2 { return confidence >= 0.36 ? .track : .survey }
-        if band >= 3 { return confidence >= 0.55 ? .lock : .track }
-        return .track
-    }
-
-    private func atomWindow(for mode: TrackerMode, band: Int, spectrum: [SignalSource: Int]) -> AtomWindow? {
-        let candidateOrder: [TrackerMode]
-        let preferredBand = preferredPitchBand(for: band)
-
-        if !sourcesAvailable(in: spectrum).isEmpty {
-            let dominant = dominantSourceTag(in: spectrum)
-            switch dominant {
-            case .wifi, .anchor:
-                candidateOrder = [mode, .anchor, .lock, .track, .survey]
-            case .bleAdvert, .bleLink:
-                candidateOrder = [mode, .track, .lock, .anchor, .survey]
-            case .classic:
-                candidateOrder = [mode, .lock, .anchor, .track, .survey]
-            }
-        } else {
-            candidateOrder = [mode, .track, .lock, .anchor, .survey]
-        }
-
-        for candidate in candidateOrder {
-            let windows = atomByMode[candidate] ?? []
-            let pitchWindows = pitchFiltered(windows, for: preferredBand)
-            if let picked = pickAtom(from: pitchWindows, by: band, mode: candidate) {
-                return picked
-            }
-
-            if let picked = pickAtom(from: windows, by: band, mode: candidate) {
-                return picked
-            }
-        }
-
-        return pickAtom(from: atomWindows, by: band, mode: .fallback)
-    }
-
-    private func preferredPitchBand(for band: Int) -> PitchBand {
-        switch band {
-        case 0, 1: return .low
-        case 2: return .mid
-        default: return .high
-        }
-    }
-
-    private func pitchFiltered(_ windows: [AtomWindow], for band: PitchBand) -> [AtomWindow] {
-        guard let fromBand = atomByBand[band], !fromBand.isEmpty, !windows.isEmpty else {
-            return windows
-        }
-        let keys = Set(windows.map { windowKey($0) })
-        let filtered = fromBand.filter { keys.contains(windowKey($0)) }
-        if filtered.isEmpty { return windows }
-        return filtered
-    }
-
-    private func windowKey(_ window: AtomWindow) -> String {
-        "\(window.start):\(window.count)"
-    }
-
-    private func sourcesAvailable(in spectrum: [SignalSource: Int]) -> [SignalSource] {
-        spectrum.filter { $0.value > 0 }.map { $0.key }
-    }
-
-    private func dominantSourceTag(in spectrum: [SignalSource: Int]) -> SignalSource {
-        if let dominant = spectrum.max(by: { lhs, rhs in
-            if lhs.value == rhs.value {
-                return lhs.key.rawValue < rhs.key.rawValue
-            }
-            return lhs.value < rhs.value
-        }) {
-            return dominant.key
-        }
-        return .bleAdvert
-    }
-
-    private func pickAtom(from windows: [AtomWindow], by band: Int, mode: TrackerMode) -> AtomWindow? {
-        guard !windows.isEmpty else { return nil }
-        let sorted = windows.sorted { $0.pitchHz < $1.pitchHz }
-        let count = sorted.count
-
-        let target = Double(max(0, min(2, band))) / 2.0
-        let tone = Int(round(target))
-        let base = max(0, min(count - 1, (count - 1) * tone / 3))
-        let spread = max(1, min(5, count / 4))
-        let from = max(0, base - spread)
-        let to = min(count - 1, base + spread)
-
-        var candidateRange = Array(from...to)
-        candidateRange.shuffle()
-
-        var last = cursorByMode[mode.id] ?? Int.random(in: 0..<count)
-        for idx in candidateRange {
-            if idx != last || count == 1 {
-                last = idx
-                cursorByMode[mode.id] = idx
-                return sorted[idx]
-            }
-        }
-
-        let fallback = cursorByMode[mode.id] ?? Int.random(in: 0..<count)
-        let next = (fallback + 1) % count
-        cursorByMode[mode.id] = next
-        return sorted[next]
-    }
-
-    private func buildAtomByBand(_ windows: [AtomWindow]) -> [PitchBand: [AtomWindow]] {
-        let validPitch = windows.filter { $0.pitchHz > 0 }
-        guard !validPitch.isEmpty else {
-            return [
-                .low: windows,
-                .mid: windows,
-                .high: windows,
-            ]
-        }
-
-        let sorted = validPitch.sorted { $0.pitchHz < $1.pitchHz }
-        let lowIndex = sorted.count / 3
-        let highIndex = max(lowIndex, (sorted.count * 2) / 3)
-
-        let lowThreshold = sorted[min(lowIndex, sorted.count - 1)].pitchHz
-        let highThreshold = sorted[min(highIndex, sorted.count - 1)].pitchHz
-
-        var byBand: [PitchBand: [AtomWindow]] = [.low: [], .mid: [], .high: []]
-        for window in windows {
-            if window.pitchHz <= 0 {
-                byBand[.mid, default: []].append(window)
-                continue
-            }
-
-            let bucket: PitchBand
-            if window.pitchHz <= lowThreshold {
-                bucket = .low
-            } else if window.pitchHz >= highThreshold {
-                bucket = .high
-            } else {
-                bucket = .mid
-            }
-            byBand[bucket, default: []].append(window)
-        }
-
-        for band in PitchBand.allCases {
-            if byBand[band]?.isEmpty == true {
-                byBand[band] = windows
-            }
-        }
-
-        return byBand
-    }
-
-    private func buildAtomByMode(_ windows: [AtomWindow]) -> [TrackerMode: [AtomWindow]] {
-        var byMode: [TrackerMode: [AtomWindow]] = [
-            .survey: [],
-            .track: [],
-            .lock: [],
-            .anchor: []
-        ]
-
-        for window in windows {
-            byMode[window.toneClass == .short ? .survey : (window.toneClass == .mid ? .track : .lock)]?.append(window)
-            if window.duration < 0.12 || window.pitchHz < 1100 {
-                byMode[.survey, default: []].append(window)
-            }
-            if window.duration > 0.18 {
-                byMode[.anchor, default: []].append(window)
-            }
-        }
-
-        for mode in TrackerMode.allCases where mode != .fallback {
-            if byMode[mode] == nil || byMode[mode]!.isEmpty {
-                byMode[mode] = windows
-            }
-        }
-
-        return byMode
-    }
-
-    private func discoverAtoms(in file: AVAudioFile, sampleRate: Double) -> [AtomWindow] {
-        guard let samples = readMonoSamples(from: file) else {
-            return fallbackAtoms(fileLength: file.length)
-        }
-        guard !samples.isEmpty else {
-            return fallbackAtoms(fileLength: file.length)
-        }
-
-        let cleaned = normalize(samples)
-        guard let maxPeak = cleaned.map(abs).max(), maxPeak > 0.00008 else {
-            return fallbackAtoms(fileLength: file.length)
-        }
-
-        let envelope = movingAverage(
-            cleaned.map { abs($0) },
-            window: max(16, Int(sampleRate * 0.006))
-        )
-
-        let noiseFloor = quantile(envelope, 0.45)
-        let mad = medianAbsoluteDeviation(envelope, around: noiseFloor)
-        let threshold = max(0.0008, noiseFloor + mad * 2.6)
-
-        let minGap = Int(sampleRate * 0.012)
-        let pad = Int(sampleRate * 0.012)
-
-        var candidates: [AtomWindow] = []
-        var start: Int?
-
-        var i = 0
-        while i < envelope.count {
-            if envelope[i] > threshold {
-                if start == nil { start = i }
-            } else if let opened = start {
-                let rawEnd = i
-                let segmentStart = max(0, opened - pad)
-                let segmentEnd = min(samples.count, rawEnd + pad)
-
-                if let atom = makeAtom(start: segmentStart, end: segmentEnd, samples: cleaned, sampleRate: sampleRate) {
-                    candidates.append(atom)
-                }
-                start = nil
-            }
-            i += 1
-        }
-
-        if let opened = start {
-            let segmentStart = max(0, opened - pad)
-            let segmentEnd = samples.count
-            if let atom = makeAtom(start: segmentStart, end: segmentEnd, samples: cleaned, sampleRate: sampleRate) {
-                candidates.append(atom)
-            }
-        }
-
-        var merged: [AtomWindow] = []
-        for atom in candidates.sorted(by: { $0.start < $1.start }) {
-            if let last = merged.last,
-               atom.start <= last.start + AVAudioFramePosition(atom.count) &&
-               last.start <= atom.start &&
-               atom.start - (last.start + AVAudioFramePosition(last.count)) < AVAudioFramePosition(minGap) {
-                let maxEnd = max(last.start + AVAudioFramePosition(last.count), atom.start + AVAudioFramePosition(atom.count))
-                let mergedAtom = AtomWindow(
-                    start: last.start,
-                    count: AVAudioFrameCount(maxEnd - last.start),
-                    energy: max(last.energy, atom.energy),
-                    pitchHz: atom.pitchHz,
-                    duration: max(atom.duration, last.duration),
-                    toneClass: atom.toneClass,
-                    rms: max(last.rms, atom.rms)
-                )
-                _ = merged.removeLast()
-                merged.append(mergedAtom)
-            } else {
-                merged.append(atom)
-            }
-        }
-
-        let filtered = merged.filter {
-            Double($0.duration) >= 0.085 && Double($0.duration) <= 0.30 && $0.rms > max(0.015, 0.06 * maxPeak)
-        }
-        let sorted = filtered
-            .sorted {
-                if $0.energy == $1.energy {
-                    return $0.count > $1.count
-                }
-                return $0.energy > $1.energy
-            }
-            .prefix(36)
-
-        guard !sorted.isEmpty else {
-            return fallbackAtoms(fileLength: file.length)
-        }
-
-        return Array(sorted).sorted { $0.start < $1.start }
-    }
-
-    private func makeAtom(start: Int, end: Int, samples: [Float], sampleRate: Double) -> AtomWindow? {
-        guard end > start + 600 else { return nil }
-        let clampedStart = max(0, start)
-        let clampedEnd = min(samples.count, end)
-        guard clampedEnd > clampedStart else { return nil }
-
-        let length = clampedEnd - clampedStart
-        let duration = Double(length) / sampleRate
-        if duration < 0.06 || duration > 0.32 { return nil }
-
-        let energy = rms(samples, from: clampedStart, to: clampedEnd)
-        let peak = peak(samples, from: clampedStart, to: clampedEnd)
-        guard peak > 0 else { return nil }
-        let normalizedEnergy = energy / max(peak, 1e-12)
-
-        let pitch = estimatePitchHz(samples: samples,
-                                   sampleRate: sampleRate,
-                                   start: clampedStart,
-                                   end: clampedEnd)
-
-        let toneClass: ToneClass
-        if duration <= 0.12 {
-            toneClass = .short
-        } else if duration <= 0.19 {
-            toneClass = .mid
-        } else {
-            toneClass = .long
-        }
-
-        let frameCount = AVAudioFrameCount(length)
-        return AtomWindow(
-            start: AVAudioFramePosition(clampedStart),
-            count: frameCount,
-            energy: energy,
-            pitchHz: pitch,
-            duration: duration,
-            toneClass: toneClass,
-            rms: normalizedEnergy
-        )
-    }
-
-    private func readMonoSamples(from file: AVAudioFile) -> [Float]? {
-        file.framePosition = 0
-        let totalFrames = AVAudioFrameCount(file.length)
-        guard totalFrames > 0 else { return nil }
-
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: totalFrames) else {
-            return nil
-        }
-
-        do {
-            try file.read(into: buffer)
-        } catch {
-            return nil
-        }
-
-        let length = Int(buffer.frameLength)
-        guard let data = buffer.floatChannelData else { return nil }
-        let channels = Int(file.processingFormat.channelCount)
-
-        var out = [Float](repeating: 0, count: length)
-        for i in 0..<length {
-            var sum: Float = 0
-            for ch in 0..<channels {
-                sum += abs(data[ch][i])
-            }
-            out[i] = sum / Float(channels)
-        }
-
-        return out
-    }
-
-    private func normalize(_ samples: [Float]) -> [Float] {
-        guard let peak = samples.max(by: { abs($0) < abs($1) }), abs(peak) > 0.0005 else {
-            return samples
-        }
-        let scale = 1.0 / abs(peak)
-        return samples.map { $0 * scale }
-    }
-
-    private func movingAverage(_ values: [Float], window: Int) -> [Float] {
-        guard !values.isEmpty else { return [] }
-        guard window > 1 else { return values }
-
-        var out = [Float](repeating: 0, count: values.count)
-        var sum: Float = 0
-        let floatWindow = Float(window)
-
-        for idx in 0..<values.count {
-            sum += values[idx]
-            if idx >= window {
-                sum -= values[idx - window]
-                out[idx] = sum / floatWindow
-            } else {
-                out[idx] = sum / Float(idx + 1)
-            }
-        }
-
-        return out
-    }
-
-    private func quantile(_ values: [Float], _ point: Double) -> Float {
-        guard !values.isEmpty else { return 0 }
-        let sorted = values.sorted()
-        let idx = Int((Double(sorted.count - 1) * point).rounded())
-        return sorted[min(max(0, idx), sorted.count - 1)]
-    }
-
-    private func medianAbsoluteDeviation(_ values: [Float], around median: Float) -> Float {
-        guard !values.isEmpty else { return 0 }
-        let shifted = values.map { abs($0 - median) }
-        return quantile(shifted, 0.5)
-    }
-
-    private func rms(_ samples: [Float], from start: Int, to end: Int) -> Float {
-        guard start < end, end <= samples.count, start >= 0 else { return 0 }
-        var acc: Float = 0
-        for i in start..<end {
-            let v = samples[i]
-            acc += v * v
-        }
-        let mean = acc / Float(end - start)
-        return sqrt(max(0.0, mean))
-    }
-
-    private func peak(_ samples: [Float], from start: Int, to end: Int) -> Float {
-        guard start < end, end <= samples.count, start >= 0 else { return 0 }
-        var peak: Float = 0
-        for i in start..<end {
-            let v = abs(samples[i])
-            if v > peak { peak = v }
-        }
-        return peak
-    }
-
-    private func estimatePitchHz(samples: [Float], sampleRate: Double, start: Int, end: Int) -> Float {
-        guard end > start + 256 else { return 0 }
-        let clipStart = max(0, start)
-        let clipEnd = min(samples.count, end)
-        guard clipEnd > clipStart + 256 else { return 0 }
-
-        var segment = Array(samples[clipStart..<clipEnd])
-        let trim = max(0, segment.count / 14)
-        if trim * 2 < segment.count {
-            segment.removeFirst(trim)
-            segment.removeLast(trim)
-        }
-
-        let count = segment.count
-        let mean = segment.reduce(0, +) / Float(count)
-        for i in 0..<count {
-            segment[i] -= mean
-        }
-
-        let minLag = max(1, Int(sampleRate / Double(maxPitchHz)))
-        let maxLag = min(Int(sampleRate / Double(minPitchHz)), max(1, count / 2))
-        guard maxLag > minLag else { return 0 }
-
-        var bestLag = 0
-        var bestScore: Float = 0
-
-        for lag in stride(from: minLag, through: maxLag, by: 1) {
-            var score: Float = 0
-            let maxI = count - lag
-            for i in 0..<maxI {
-                score += segment[i] * segment[i + lag]
-            }
-            score /= Float(maxI)
-            if score > bestScore {
-                bestScore = score
-                bestLag = lag
-            }
-        }
-
-        guard bestLag > 0 else { return 0 }
-        let pitch = Float(sampleRate / Double(bestLag))
-        guard pitch >= minPitchHz && pitch <= maxPitchHz else { return 0 }
-        return pitch
-    }
-
-    private func fallbackAtoms(fileLength: AVAudioFramePosition) -> [AtomWindow] {
-        guard fileLength >= 8_000 else { return [] }
-        let frameDuration: AVAudioFramePosition = 2_900
-        let step = max(1, fileLength / 6)
-
-        return (0..<6).compactMap { idx -> AtomWindow? in
-            let start = AVAudioFramePosition(idx) * step
-            let end = min(fileLength, start + frameDuration)
-            guard end > start else { return nil }
-            let len = Int(end - start)
-            let duration = Double(len) / 44_100.0
-            return AtomWindow(
-                start: start,
-                count: AVAudioFrameCount(end - start),
-                energy: 1,
-                pitchHz: 1800,
-                duration: duration,
-                toneClass: duration > 0.19 ? .long : .mid,
-                rms: 1
+        queue.async { [weak self] in
+            self?.applyUpdate(
+                rssi: rssi,
+                sources: sources,
+                spectrum: spectrum,
+                confidence: confidence,
+                estimate: estimate,
+                focusIdentity: focusIdentity
             )
         }
     }
 
-    private func bandIndex(for rssi: Int) -> Int {
-        if rssi <= Int(distant) { return 0 }
-        if rssi <= -85 { return 1 }
-        if rssi <= -75 { return 2 }
-        if rssi <= -65 { return 3 }
-        return 4
+    func stop() {
+        queue.sync {
+            guard !isStopping else { return }
+            isStopping = true
+            isRunning = false
+            lookAheadTimer?.cancel()
+            lookAheadTimer = nil
+            fallbackTimer?.cancel()
+            fallbackTimer = nil
+
+            player.stop()
+            if engine.isRunning {
+                engine.stop()
+            }
+            if systemFallbackSound != 0 {
+                AudioServicesDisposeSystemSoundID(systemFallbackSound)
+                systemFallbackSound = 0
+            }
+            queuedBeatCount = 0
+        }
     }
 
-    private func stop() {
-        timer?.invalidate()
-        timer = nil
-        token += 1
-        currentMode = nil
-        latestConfidence = 0
-        latestEstimate = nil
-        latestSpectrum.removeAll()
-        lastSources.removeAll()
-        player?.stop()
+    // MARK: - Audio update + scheduling
+
+    private func applyUpdate(
+        rssi: Int?,
+        sources: Set<SignalSource>,
+        spectrum: [SignalSource: Int],
+        confidence: Double,
+        estimate: TriangulationEstimate?,
+        focusIdentity: String?
+    ) {
+        _ = estimate
+        if !sources.isEmpty { _ = sectorHash(from: focusIdentity) }
+        _ = spectrum
+
+        self.confidence = max(0.0, min(1.0, confidence))
+        sector = sectorHash(from: focusIdentity)
+
+        let now = Date()
+
+        guard let rssi else {
+            staleState = .stale
+            if let seen = lastTargetSeen {
+                let age = now.timeIntervalSince(seen)
+                if age >= profile.fadingTargetWindow {
+                    setIdleMode()
+                } else if age >= profile.freshTargetWindow {
+                    staleState = .fading
+                }
+            } else {
+                setIdleMode()
+            }
+            return
+        }
+
+        let raw = rawProximity(from: rssi)
+        let filtered = filter.update(raw: raw, now: now)
+        lastTargetSeen = now
+
+        staleState = .fresh
+        mode = .tracking
+
+        let pairs = activePairs()
+        let pairCount = max(1, pairs.count)
+        let requested = pairCount > 1 ? Int(round(filtered * Double(pairCount - 1))) : 0
+
+        if abs(filtered - pairHoldProximity) >= profile.proximityHysteresis {
+            pairHoldProximity = filtered
+            requestedPairHold = requested
+            requestedPairIndex = requested
+        } else {
+            requestedPairIndex = requestedPairHold
+        }
+
+        requestedPairIndex = profile.clampPairIndex(requestedPairIndex, pairCount: pairCount)
+        player.volume = scheduledGain()
+        player.pan = targetPan
+    }
+
+    private var targetPan: Float {
+        let normalized = (Double(sector) / 8.0) - 0.5
+        return Float(normalized * 0.8)
+    }
+
+    private func rawProximity(from rssi: Int) -> Double {
+        return (Double(rssi) - profile.proximityFarRSSI) / (profile.proximityNearRSSI - profile.proximityFarRSSI)
+    }
+
+    private func setIdleMode() {
+        mode = .idle
+        let pairs = idlePairs
+        let defaultPair = min(profile.fallbackIdlePairIndex, max(0, pairs.count - 1))
+        currentPairIndex = defaultPair
+        requestedPairIndex = defaultPair
+        requestedPairHold = defaultPair
+        pairHoldProximity = 0
+        staleState = .stale
+        nextBeatNumber = max(0, nextBeatNumber)
+        pairAdjustmentAnchorBeat = max(0, pairAdjustmentAnchorBeat)
+        player.volume = scheduledGain()
+    }
+
+    private func startSchedulers() {
+        if usedSystemFallback {
+            startFallbackTimer()
+            return
+        }
+
+        startLookAheadTimer()
+    }
+
+    private func startLookAheadTimer() {
+        lookAheadTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now(), repeating: lookAheadInterval)
+        timer.setEventHandler { [weak self] in
+            self?.drainScheduler()
+        }
+        lookAheadTimer = timer
+        timer.resume()
+    }
+
+    private func startFallbackTimer() {
+        fallbackTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now(), repeating: profile.beatDuration)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            if self.isStopping { return }
+            AudioServicesPlaySystemSound(self.systemFallbackSound)
+        }
+        fallbackTimer = timer
+        timer.resume()
+    }
+
+    private func drainScheduler() {
+        guard isRunning, !isStopping, !usedSystemFallback else { return }
+        guard sourceBuffer != nil else { return }
+
+        while queuedBeatCount < lookAheadBeats {
+            guard let buffer = nextBeatBuffer() else { break }
+
+            let beat = nextBeatNumber
+            let scheduleFrame = absoluteFrame(forBeat: beat)
+            debugScheduledSampleFrame = scheduleFrame
+            let time = AVAudioTime(sampleTime: scheduleFrame, atRate: outputFormat.sampleRate)
+
+            player.scheduleBuffer(buffer, at: time, completionCallbackType: .dataPlayedBack) { [weak self] _ in
+                self?.queue.async {
+                    guard let self else { return }
+                    self.queuedBeatCount = max(0, self.queuedBeatCount - 1)
+                    self.lastPairUpdate = max(self.lastPairUpdate, beat)
+                    if self.debugEnabled {
+                        let now = Date()
+                        if now.timeIntervalSince(self.lastDebug) > 1.5 {
+                            self.logDiagnostics()
+                            self.lastDebug = now
+                        }
+                    }
+                }
+            }
+
+            queuedBeatCount += 1
+            nextBeatNumber += 1
+            schedulePairStepIfNeeded(afterBeat: beat)
+
+            let expectedEnd = scheduleFrame + AVAudioFramePosition(buffer.frameLength)
+            if expectedEnd >= AVAudioFramePosition(Int64(sourceBuffer?.frameLength ?? 0)) {
+                lateScheduleCount += 1
+            }
+        }
+
+        updateFreshnessState()
+
+        if queuedBeatCount < lookAheadBeats, staleState == .stale {
+            setIdleMode()
+        }
+    }
+
+    private func nextBeatBuffer() -> AVAudioPCMBuffer? {
+        let pairs = activePairs()
+        guard !pairs.isEmpty else { return nil }
+
+        let activeIndex = profile.clampPairIndex(currentPairIndex, pairCount: pairs.count)
+        let pair = pairs[activeIndex]
+        let phase = nextBeatNumber % max(1, profile.beatsPerPhrase)
+        return phase == 0 ? pair.first.buffer : pair.second.buffer
+    }
+
+    private func schedulePairStepIfNeeded(afterBeat beat: Int) {
+        // Move the requested source pair at most once per two-beat phrase.
+        guard !activePairs().isEmpty else { return }
+        if beat % 2 == 1 && beat - pairAdjustmentAnchorBeat >= 2 {
+            let target = profile.clampPairIndex(requestedPairIndex, pairCount: activePairs().count)
+            if target != currentPairIndex {
+                currentPairIndex += target > currentPairIndex ? 1 : -1
+                currentPairIndex = profile.clampPairIndex(currentPairIndex, pairCount: activePairs().count)
+                pairAdjustmentAnchorBeat = beat
+                player.volume = scheduledGain()
+                player.pan = targetPan
+            }
+        }
+    }
+
+    private func updateFreshnessState() {
+        guard let seen = lastTargetSeen else {
+            staleState = .stale
+            mode = .idle
+            return
+        }
+
+        let age = Date().timeIntervalSince(seen)
+        if age >= profile.fadingTargetWindow {
+            staleState = .stale
+            mode = .idle
+            requestedPairIndex = profile.clampPairIndex(profile.fallbackIdlePairIndex, pairCount: max(1, activePairs().count))
+        } else if age >= profile.freshTargetWindow {
+            staleState = .fading
+        } else {
+            staleState = .fresh
+        }
+    }
+
+    private func absoluteFrame(forBeat beat: Int) -> AVAudioFramePosition {
+        AVAudioFramePosition(firstBeatFrame + AVAudioFramePosition(Double(beat) * exactFramesPerBeat))
+    }
+
+    private func activePairs() -> [BeatPair] {
+        switch mode {
+        case .tracking:
+            return trackingPairs.isEmpty ? idlePairs : trackingPairs
+        case .idle:
+            return idlePairs
+        }
+    }
+
+    static func buildBeatPairs(from buffer: AVAudioPCMBuffer, profile: MotionTrackerAudioProfile) -> (idle: [BeatPair], tracking: [BeatPair]) {
+        let exactFramesPerBeat = 60.0 / profile.bpm * buffer.format.sampleRate
+        let cells = buildBeatCells(from: buffer, profile: profile, exactFramesPerBeat: exactFramesPerBeat)
+        return buildBeatPairs(from: cells, profile: profile)
+    }
+
+    static func buildBeatPairs(from cells: [BeatCell], profile: MotionTrackerAudioProfile) -> (idle: [BeatPair], tracking: [BeatPair]) {
+
+        let trackingRange = profile.trackingRange(totalBeats: cells.count)
+        let pairRangeFor: (Range<Int>) -> [BeatPair] = { range in
+            guard range.count >= 2 else { return [] }
+            let start = max(0, range.lowerBound)
+            let end = min(cells.count, range.upperBound)
+            if end - start < 2 { return [] }
+
+            var pairs: [BeatPair] = []
+            var pairIndex = 0
+            var i = start
+            while i + 1 < end {
+                let first = cells[i]
+                let second = cells[i + 1]
+                let pairProgress = (first.sourceProgress + second.sourceProgress) * 0.5
+                pairs.append(
+                    BeatPair(
+                        pairIndex: pairIndex,
+                        first: first,
+                        second: second,
+                        sourceProgress: pairProgress
+                    )
+                )
+                pairIndex += 1
+                i += 2
+            }
+            return pairs
+        }
+
+        var idlePairs = pairRangeFor(profile.idleBeatRange)
+        let trackingPairs = pairRangeFor(trackingRange)
+
+        if idlePairs.isEmpty {
+            idlePairs = pairRangeFor(0..<max(1, cells.count))
+        }
+        if trackingPairs.isEmpty {
+            return (idlePairs, idlePairs)
+        }
+
+        return (idlePairs, trackingPairs)
+    }
+
+    static func buildBeatCells(from buffer: AVAudioPCMBuffer, profile: MotionTrackerAudioProfile, exactFramesPerBeat: Double) -> [BeatCell] {
+        var cells: [BeatCell] = []
+
+        let totalFrames = Int(buffer.frameLength)
+        let firstBeatFrame = AVAudioFramePosition(profile.firstBeatOffsetSeconds * buffer.format.sampleRate)
+        if totalFrames <= 0 { return [] }
+
+        var beatIndex = 0
+        while true {
+            let start = Int((Double(firstBeatFrame) + Double(beatIndex) * exactFramesPerBeat).rounded())
+            let end = Int((Double(firstBeatFrame) + Double(beatIndex + 1) * exactFramesPerBeat).rounded())
+            if end > totalFrames { break }
+            if end <= start { beatIndex += 1; continue }
+
+            let length = end - start
+            guard let segment = buffer.makeSegment(from: start, frameLength: length) else {
+                beatIndex += 1
+                continue
+            }
+
+            let progress = Double(start) / Double(max(1, totalFrames))
+            cells.append(
+                BeatCell(
+                    index: beatIndex,
+                    startFrame: AVAudioFramePosition(start),
+                    frameLength: AVAudioFrameCount(length),
+                    accent: .unknown,
+                    sourceProgress: progress,
+                    buffer: segment
+                )
+            )
+            beatIndex += 1
+        }
+
+        // Infer strong/weak alternating accent by energy per pair while preserving timeline order.
+        for i in stride(from: 0, to: cells.count - 1, by: 2) {
+            if i + 1 >= cells.count { break }
+
+            let firstEnergy = cells[i].buffer.rmsEnergy()
+            let secondEnergy = cells[i + 1].buffer.rmsEnergy()
+            if firstEnergy >= secondEnergy {
+                cells[i] = BeatCell(
+                    index: cells[i].index,
+                    startFrame: cells[i].startFrame,
+                    frameLength: cells[i].frameLength,
+                    accent: .strong,
+                    sourceProgress: cells[i].sourceProgress,
+                    buffer: cells[i].buffer
+                )
+                cells[i + 1] = BeatCell(
+                    index: cells[i + 1].index,
+                    startFrame: cells[i + 1].startFrame,
+                    frameLength: cells[i + 1].frameLength,
+                    accent: .weak,
+                    sourceProgress: cells[i + 1].sourceProgress,
+                    buffer: cells[i + 1].buffer
+                )
+            } else {
+                cells[i] = BeatCell(
+                    index: cells[i].index,
+                    startFrame: cells[i].startFrame,
+                    frameLength: cells[i].frameLength,
+                    accent: .weak,
+                    sourceProgress: cells[i].sourceProgress,
+                    buffer: cells[i].buffer
+                )
+                cells[i + 1] = BeatCell(
+                    index: cells[i + 1].index,
+                    startFrame: cells[i + 1].startFrame,
+                    frameLength: cells[i + 1].frameLength,
+                    accent: .strong,
+                    sourceProgress: cells[i + 1].sourceProgress,
+                    buffer: cells[i + 1].buffer
+                )
+            }
+
+            applyFade(to: cells[i].buffer)
+            applyFade(to: cells[i + 1].buffer)
+        }
+
+        return cells
+    }
+
+    private func scheduledGain() -> Float {
+        let confidenceGain = 0.4 + (0.6 * confidence)
+        let freshnessGain: Double
+        switch staleState {
+        case .fresh: freshnessGain = 1.0
+        case .fading: freshnessGain = 0.72
+        case .stale: freshnessGain = 0.45
+        }
+        let proximity = filter.filtered
+        let tonalGain = 0.3 + 0.7 * proximity
+        return Float(confidenceGain * freshnessGain * tonalGain)
+    }
+
+    private func sectorHash(from identity: String?) -> Int {
+        guard let identity else { return 0 }
+        return abs(identity.utf8.reduce(0) { result, byte in (result &* 31) &+ Int(byte) }) % 8
+    }
+
+    static func resolveAudioURL(explicitPath: String?) -> (url: URL, resolution: AudioSourceResolution)? {
+        if let explicitPath {
+            let expanded = (explicitPath as NSString).expandingTildeInPath
+            if FileManager.default.fileExists(atPath: expanded) {
+                return (URL(fileURLWithPath: expanded), .explicitPath(expanded))
+            }
+            FileHandle.standardError.write(Data("findphone: explicit audio path not found: \(expanded)\n".utf8))
+            return nil
+        }
+
+        if let override = ProcessInfo.processInfo.environment[audioFileOverrideEnv]?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !override.isEmpty {
+            let expanded = (override as NSString).expandingTildeInPath
+            if FileManager.default.fileExists(atPath: expanded) {
+                return (URL(fileURLWithPath: expanded), .overrideEnv(expanded))
+            }
+            FileHandle.standardError.write(Data("findphone: audio override not found at \(expanded)\n".utf8))
+            return nil
+        }
+
+        if let bundled = Bundle.module.url(forResource: audioResourceName, withExtension: "m4a") {
+            return (bundled, .bundled)
+        }
+
+        return nil
+    }
+
+    static func decodeAudioFile(at url: URL, decodeTo targetFormat: AVAudioFormat) -> AVAudioPCMBuffer? {
+        do {
+            let file = try AVAudioFile(forReading: url)
+            let sourceSampleRate = file.processingFormat.sampleRate
+            let sourceChannels = Int(file.processingFormat.channelCount)
+            if sourceSampleRate <= 0 || sourceChannels <= 0 {
+                return nil
+            }
+
+            let decodeFormat = AVAudioFormat(
+                commonFormat: .pcmFormatFloat32,
+                sampleRate: sourceSampleRate,
+                channels: AVAudioChannelCount(sourceChannels),
+                interleaved: false
+            ) ?? file.processingFormat
+
+            let frames = AVAudioFrameCount(file.length)
+            guard let decoded = AVAudioPCMBuffer(pcmFormat: decodeFormat, frameCapacity: frames) else { return nil }
+            decoded.frameLength = frames
+            try file.read(into: decoded)
+
+            if decoded.format.sampleRate == targetFormat.sampleRate,
+               decoded.format.channelCount == targetFormat.channelCount,
+               decoded.format.commonFormat == targetFormat.commonFormat,
+               decoded.format.isInterleaved == targetFormat.isInterleaved {
+                return decoded
+            }
+
+            return convertBuffer(decoded, to: targetFormat)
+        } catch {
+            return nil
+        }
+    }
+
+    private static func convertBuffer(_ source: AVAudioPCMBuffer, to targetFormat: AVAudioFormat) -> AVAudioPCMBuffer? {
+        guard let converter = AVAudioConverter(from: source.format, to: targetFormat) else { return nil }
+
+        let requestedFrames = Double(source.frameLength) * targetFormat.sampleRate / source.format.sampleRate
+        let targetCapacity = AVAudioFrameCount(max(2, Int64(ceil(requestedFrames + 32.0))))
+        guard let output = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: targetCapacity) else { return nil }
+
+        var convertedFrames: AVAudioFrameCount = 0
+        var sourceOffset: AVAudioFrameCount = 0
+
+        let inputBlock: AVAudioConverterInputBlock = { packetCount, status in
+            guard sourceOffset < source.frameLength else {
+                status.pointee = .endOfStream
+                return nil
+            }
+
+            let channels = Int(source.format.channelCount)
+            let remaining = source.frameLength - sourceOffset
+            let frameCount = min(AVAudioFrameCount(packetCount), remaining)
+            guard let input = AVAudioPCMBuffer(pcmFormat: source.format, frameCapacity: frameCount) else {
+                status.pointee = .noDataNow
+                return nil
+            }
+            input.frameLength = frameCount
+
+            guard let sourceData = source.floatChannelData, let inputData = input.floatChannelData else {
+                status.pointee = .noDataNow
+                return nil
+            }
+
+            for ch in 0..<channels {
+                memcpy(inputData[ch], sourceData[ch].advanced(by: Int(sourceOffset)), Int(frameCount) * MemoryLayout<Float>.size)
+            }
+
+            sourceOffset += frameCount
+            status.pointee = sourceOffset >= source.frameLength ? .endOfStream : .haveData
+            return input
+        }
+
+        var error: NSError?
+        let status = converter.convert(to: output, error: &error, withInputFrom: inputBlock)
+        if status == .error {
+            return nil
+        }
+
+        convertedFrames = output.frameLength
+        if convertedFrames == 0 {
+            output.frameLength = output.frameCapacity
+        }
+        return output
+    }
+
+    private func logDiagnostics(force: Bool = false) {
+        if !debugEnabled { return }
+
+        let now = Date()
+        if !force && now.timeIntervalSince(lastDebug) < 1.5 { return }
+        lastDebug = now
+
+        var lines: [String] = []
+        lines.append("path=\(sourceURL?.path ?? "(system-fallback)")")
+        if let sourceFormat {
+            lines.append("sourceFormat=\(sourceFormat.sampleRate)Hz/\(sourceFormat.channelCount)ch/\(sourceFormat.commonFormat)")
+        }
+        lines.append("processingFormat=\(outputFormat.sampleRate)Hz/\(outputFormat.channelCount)ch/\(outputFormat.commonFormat)")
+        lines.append("engineOutputFormat=\(engineOutputFormat.sampleRate)Hz/\(engineOutputFormat.channelCount)ch/\(engineOutputFormat.commonFormat)")
+        lines.append("duration=\(String(format: "%.3f", sourceDuration))")
+        lines.append("bpm=\(String(format: "%.2f", profile.bpm))")
+        lines.append("beatDuration=\(String(format: "%.4f", profile.beatDuration))")
+        lines.append("exactFramesPerBeat=\(String(format: "%.3f", exactFramesPerBeat))")
+        lines.append("beatCells=\(beatCellCount)")
+        lines.append("idleRange=\(profile.idleBeatRange)")
+        lines.append("trackingRange=\(profile.trackingRange(totalBeats: beatCellCount))")
+        lines.append("filteredProx=\(String(format: "%.3f", filter.filtered))")
+        lines.append("requestedPair=\(requestedPairIndex)")
+        lines.append("currentPair=\(currentPairIndex)")
+        lines.append("scheduledBeat=\(nextBeatNumber)")
+        lines.append("scheduledSample=\(debugScheduledSampleFrame)")
+        lines.append("queued=\(queuedBeatCount)")
+        lines.append("lateSchedules=\(lateScheduleCount)")
+        lines.append("engineRestarts=\(engineStartCount)")
+
+        FileHandle.standardError.write(Data("[audio] \(lines.joined(separator: ", "))\n".utf8))
+    }
+
+    private static func applyFade(to buffer: AVAudioPCMBuffer) {
+        guard let data = buffer.floatChannelData else { return }
+        let channels = Int(buffer.format.channelCount)
+        let frames = Int(buffer.frameLength)
+        if channels == 0 || frames == 0 { return }
+
+        let fadeDurationSeconds = 0.003
+        let fadeFrames = max(1, min(Int(fadeDurationSeconds * buffer.format.sampleRate), frames / 2))
+
+        for ch in 0..<channels {
+            let ptr = data[ch]
+            for i in 0..<fadeFrames {
+                let g = Float(i) / Float(fadeFrames)
+                ptr[i] *= g
+                ptr[frames - 1 - i] *= g
+            }
+        }
+    }
+
+    private static func configureFallbackSystemSound() -> SystemSoundID? {
+        guard FileManager.default.fileExists(atPath: legacySystemFallbackPath) else { return nil }
+        var id: SystemSoundID = 0
+        let status = AudioServicesCreateSystemSoundID(URL(fileURLWithPath: legacySystemFallbackPath) as CFURL, &id)
+        guard status == kAudioServicesNoError else { return nil }
+        return id
+    }
+
+    private var sourceDuration: TimeInterval {
+        guard let buffer = sourceBuffer else { return 0 }
+        return Double(buffer.frameLength) / buffer.format.sampleRate
+    }
+}
+
+private extension AVAudioPCMBuffer {
+    func rmsEnergy() -> Float {
+        guard let data = floatChannelData else { return 0 }
+        let channels = Int(format.channelCount)
+        let frames = Int(frameLength)
+        if channels == 0 || frames == 0 { return 0 }
+
+        var sum: Float = 0
+        for ch in 0..<channels {
+            let ptr = data[ch]
+            for i in 0..<frames {
+                sum += ptr[i] * ptr[i]
+            }
+        }
+        return sqrt(sum / Float(channels * frames))
+    }
+
+    func makeSegment(from startFrame: Int, frameLength: Int) -> AVAudioPCMBuffer? {
+        guard let data = floatChannelData else { return nil }
+        let available = Int(self.frameLength)
+        guard frameLength > 0, startFrame >= 0, startFrame + frameLength <= available else { return nil }
+        guard let dst = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frameLength)) else { return nil }
+        dst.frameLength = AVAudioFrameCount(frameLength)
+
+        let channels = Int(format.channelCount)
+        for ch in 0..<channels {
+            memcpy(dst.floatChannelData![ch], data[ch].advanced(by: startFrame), frameLength * MemoryLayout<Float>.size)
+        }
+        return dst
     }
 }
