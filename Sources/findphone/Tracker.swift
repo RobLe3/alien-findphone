@@ -1,5 +1,6 @@
 import Foundation
 import CoreBluetooth
+import CoreWLAN
 
 enum LinkState: String {
     case down = "LINK DOWN"
@@ -15,23 +16,6 @@ let continuityNames: [UInt8: String] = [
 /// Continuity message types that phones, tablets and watches emit.
 let handheldTypes = Set(continuityNames.keys)
 
-struct Advertiser {
-    var name: String?
-    var peak: Int
-    var smoothed: Double
-    var types: Set<UInt8>
-    var last: Date
-
-    /// What the device is, from its Continuity advertisement. Carries no
-    /// identity, so it is what redacted output falls back to.
-    var kind: String {
-        let kinds = types.compactMap { continuityNames[$0] }.sorted()
-        return kinds.isEmpty ? "unknown" : kinds.joined(separator: ",")
-    }
-
-    var label: String { name ?? kind }
-}
-
 struct Snapshot {
     let targetName: String?
     let address: String?
@@ -40,8 +24,13 @@ struct Snapshot {
     let readings: [Reading]
     let link: LinkState
     let radioIssue: String?
-    let advertisers: [Advertiser]
+    let assets: [TrackedAsset]
+    let potentialAssets: [TrackedAsset]
+    let sourceDistribution: [SignalSource: Int]
     let deviceCount: Int
+    let estimate: TriangulationEstimate?
+    let focusAsset: TrackedAsset?
+    let focusReadings: [Reading]
 
     /// The reading everything reports: a short median, so one reflected spike
     /// cannot move the number, the arrow and the clicks apart from each other.
@@ -53,34 +42,48 @@ struct Snapshot {
     var isFresh: Bool {
         readings.last.map { at.timeIntervalSince($0.at) < 10 } ?? false
     }
+
+    var focusLive: Int? {
+        focusReadings.since(liveWindow, now: at).medianRSSI ?? focusReadings.last?.rssi
+    }
+
+    var focusFresh: Bool {
+        focusReadings.last.map { at.timeIntervalSince($0.at) < 10 } ?? false
+    }
 }
 
 private let appleCompanyID: UInt16 = 0x004C
 private let historyWindow: TimeInterval = 600
-private let advertiserTTL: TimeInterval = 20
+private let assetHistoryWindow: TimeInterval = 45
 
 final class Tracker: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     private let targetName: String?
     private let startedAt = Date()
+    private let enableWiFi: Bool
+    private let anchorCatalog: AnchorCatalog
 
     private var central: CBCentralManager!
     private var target: CBPeripheral?
     private var linkTimer: Timer?
+    private var wifiTimer: Timer?
 
     private var readings: [Reading] = []
-    private var advertisers: [UUID: Advertiser] = [:]
+    private var perAssetReadings: [String: [Reading]] = [:]
     private var address: String?
     private var radioIssue: String?
     private var cachedID: UUID?
 
-    private let lock = NSLock()
     private var liveLink = false
     private var linkUp = false
+    private var assets: [String: TrackedAsset] = [:]
 
+    private let lock = NSLock()
     private var isLive: Bool { lock.withLock { liveLink } }
 
-    init(targetName: String?) {
+    init(targetName: String?, enableWiFi: Bool, anchorPath: String? = nil) {
         self.targetName = targetName
+        self.enableWiFi = enableWiFi
+        self.anchorCatalog = AnchorCatalog.load(path: anchorPath)
         super.init()
     }
 
@@ -90,6 +93,9 @@ final class Tracker: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             cachedID = DeviceCache.peripheralID(for: name)
             pollClassic(name: name)
         }
+        if enableWiFi {
+            startWiFiScan()
+        }
         Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.prune()
         }
@@ -97,32 +103,198 @@ final class Tracker: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 
     func snapshot() -> Snapshot {
         let now = Date()
+        let snapshotAssets = lock.withLock {
+            assets.values.sorted {
+                let a = $0.confidence(now: now)
+                let b = $1.confidence(now: now)
+                if a == b {
+                    return $0.bestRSSI > $1.bestRSSI
+                }
+                return a > b
+            }
+        }
+        let potential = snapshotAssets.filter { $0.confidence(now: now) >= 0.28 && $0.isFresh(at: now) }
+
+        let (focus, focusReadings): (TrackedAsset?, [Reading]) = lock.withLock {
+            let selected = primaryAsset(from: potential.isEmpty ? snapshotAssets : potential)
+            let readingHistory = selected.flatMap { perAssetReadings[$0.identity] } ?? []
+            return (selected, readingHistory)
+        }
+
+        var sourceCounts: [SignalSource: Int] = [:]
+        for asset in snapshotAssets {
+            for source in asset.sources.keys {
+                sourceCounts[source, default: 0] += 1
+            }
+        }
+        let readingSnapshot = lock.withLock { readings }
+
         return Snapshot(
             targetName: targetName,
             address: address,
             at: now,
             elapsed: Int(now.timeIntervalSince(startedAt)),
-            readings: readings,
+            readings: readingSnapshot,
             link: isLive ? .live : (linkUp ? .classic : .down),
             radioIssue: radioIssue,
-            advertisers: targetName == nil
-                ? advertisers.values.sorted { $0.smoothed > $1.smoothed }
-                : [],
-            deviceCount: advertisers.count)
+            assets: snapshotAssets,
+            potentialAssets: potential,
+            sourceDistribution: sourceCounts,
+            deviceCount: snapshotAssets.count,
+            estimate: estimate(now: now),
+            focusAsset: focus,
+            focusReadings: focusReadings
+        )
+    }
+
+    private func startWiFiScan() {
+        // Best effort: Wi‑Fi scanning can be unavailable on some systems.
+        guard CWWiFiClient.shared().interface() != nil else { return }
+        let queue = DispatchQueue(label: "findphone.wifi")
+        wifiTimer = Timer.scheduledTimer(withTimeInterval: 4.5, repeats: true) { _ in
+            queue.async { [weak self] in
+                self?.scanWiFi()
+            }
+        }
+        queue.async { [weak self] in
+            self?.scanWiFi()
+        }
+    }
+
+    private func scanWiFi() {
+        guard enableWiFi else { return }
+        let now = Date()
+        let wifiReadings = WiFiScanner.scan()
+        for reading in wifiReadings {
+            guard reading.rssi < 0, reading.rssi > -127 else { continue }
+            let bssid = reading.bssid.lowercased()
+            let identity = "wifi:\(bssid)"
+            let label = (reading.ssid?.isEmpty == false ? reading.ssid! : bssid)
+            let signal = AssetSignal(source: .wifi, identity: identity,
+                                    label: label,
+                                    rssi: reading.rssi,
+                                    at: now)
+            recordAsset(signal)
+
+            if let anchor = anchorCatalog.match(bssid: bssid, ssid: reading.ssid) {
+                recordAsset(AssetSignal(
+                    source: .anchor,
+                    identity: "anchor:\(anchor.id.lowercased())",
+                    label: anchor.label,
+                    rssi: reading.rssi,
+                    at: now
+                ))
+            }
+        }
     }
 
     private func prune() {
         let now = Date()
-        while let oldest = readings.first,
-              now.timeIntervalSince(oldest.at) >= historyWindow {
-            readings.removeFirst()
+        lock.withLock {
+            while let oldest = readings.first,
+                  now.timeIntervalSince(oldest.at) >= historyWindow {
+                readings.removeFirst()
+            }
+
+            for identity in Array(perAssetReadings.keys) {
+                perAssetReadings[identity] = perAssetReadings[identity]?.filter {
+                    now.timeIntervalSince($0.at) < historyWindow
+                }
+                if perAssetReadings[identity]?.isEmpty == true {
+                    perAssetReadings[identity] = nil
+                }
+            }
+
+            assets = assets.filter { now.timeIntervalSince($0.value.last) < assetHistoryWindow }
+            for identity in Array(perAssetReadings.keys) where assets[identity] == nil {
+                perAssetReadings.removeValue(forKey: identity)
+            }
         }
-        advertisers = advertisers.filter { now.timeIntervalSince($0.value.last) < advertiserTTL }
     }
 
-    private func record(_ rssi: Int, _ source: String) {
+    private func recordReading(_ signal: AssetSignal) {
+        let rssi = signal.rssi
         guard rssi < 0, rssi > -127 else { return }
-        readings.append(Reading(rssi: rssi, at: Date(), source: source))
+        let source = signal.source.rawValue
+        let entry = Reading(rssi: rssi, at: signal.at, source: source)
+        lock.withLock {
+            readings.append(entry)
+            perAssetReadings[signal.identity, default: []].append(entry)
+        }
+    }
+
+    private func recordAsset(_ signal: AssetSignal) {
+        lock.withLock {
+            let existing = assets[signal.identity]
+            if var current = existing {
+                current.record(signal)
+                assets[signal.identity] = current
+            } else {
+                assets[signal.identity] = TrackedAsset(
+                    identity: signal.identity,
+                    label: signal.label,
+                    rssi: signal.rssi,
+                    at: signal.at,
+                    source: signal.source)
+            }
+        }
+        recordReading(signal)
+    }
+
+    private func primaryAsset(from candidates: [TrackedAsset]) -> TrackedAsset? {
+        guard !candidates.isEmpty else { return nil }
+        if targetName == nil { return candidates.first }
+
+        let targetOnly = candidates.filter { isTargetCandidate($0) }
+        if let best = (targetOnly.isEmpty ? candidates : targetOnly).first { return best }
+        return candidates.first
+    }
+
+    private func isTargetCandidate(_ candidate: TrackedAsset) -> Bool {
+        guard targetName != nil else { return true }
+        if candidate.identity.hasPrefix("ble:") || candidate.identity.hasPrefix("classic:") {
+            return true
+        }
+        let sources = Set(candidate.sources.keys)
+        return sources.contains(.bleLink) || sources.contains(.classic)
+    }
+
+    private func estimate(now: Date) -> TriangulationEstimate? {
+        let anchored = lock.withLock { assets.values.filter { $0.sources.keys.contains(.anchor) } }
+        let catalog = Dictionary(uniqueKeysWithValues: anchorCatalog.anchors.map { ($0.id.lowercased(), $0) })
+        guard anchored.count >= 2 else { return nil }
+
+        var weightTotal = 0.0
+        var weightedX = 0.0
+        var weightedY = 0.0
+        var observed = 0
+
+        for anchorAsset in anchored {
+            let components = anchorAsset.identity.split(separator: ":", maxSplits: 1)
+            guard components.count == 2 else { continue }
+            let anchorID = String(components[1]).lowercased()
+            guard let anchor = catalog[anchorID],
+                  let x = anchor.x, let y = anchor.y,
+                  let sample = anchorAsset.sources[.anchor]
+            else { continue }
+            let age = now.timeIntervalSince(sample.at)
+            if age > 90 { continue }
+            let quality = max(0.05, (Double(sample.rssi) + 100) / 45.0)
+            let ageFactor = max(0.0, 1.0 - age / 90.0)
+            let weight = quality * ageFactor
+            weightTotal += weight
+            weightedX += x * weight
+            weightedY += y * weight
+            observed += 1
+        }
+
+        guard weightTotal > 0 else { return nil }
+        return TriangulationEstimate(
+            x: weightedX / weightTotal,
+            y: weightedY / weightTotal,
+            confidence: min(1.0, Double(observed) / 6.0),
+            sources: observed
+        )
     }
 
     // MARK: - Classic polling
@@ -148,7 +320,17 @@ final class Tracker: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                     DispatchQueue.main.async {
                         self.address = found?.address ?? self.address
                         self.linkUp = value != nil
-                        if changed, let v = value { self.record(v, "classic") }
+                        if changed, let v = value {
+                                                        if let addr = self.address {
+                                self.recordAsset(AssetSignal(
+                                    source: .classic,
+                                    identity: "classic:\(addr)",
+                                    label: "Classic: \(found?.name ?? name)",
+                                    rssi: v,
+                                    at: Date()
+                                ))
+                            }
+                        }
                     }
                 }
                 Thread.sleep(forTimeInterval: 0.4)
@@ -208,31 +390,36 @@ final class Tracker: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         guard r < 0, r > -127 else { return }
 
         let types = continuityTypes(d)
-        if targetName == nil && types.isDisjoint(with: handheldTypes) { return }
+        let name = (d[CBAdvertisementDataLocalNameKey] as? String) ?? p.name
+        let recognized = types.intersection(handheldTypes).isEmpty == false || name != nil
 
         let now = Date()
-        var a = advertisers[p.identifier, default:
-            Advertiser(name: nil, peak: r, smoothed: Double(r), types: [], last: now)]
-        a.name = a.name ?? (d[CBAdvertisementDataLocalNameKey] as? String ?? p.name)
-        a.peak = max(a.peak, r)
-        a.smoothed = a.smoothed * 0.7 + Double(r) * 0.3
-        a.types.formUnion(types)
-        a.last = now
-        advertisers[p.identifier] = a
 
-        guard let t = targetName, let n = a.name,
-              n.localizedCaseInsensitiveContains(t) else { return }
-        record(r, "advert")
+        if targetName != nil {
+            if let t = targetName, let n = name, n.localizedCaseInsensitiveContains(t) {
+                let identity = "ble:\(p.identifier.uuidString)"
+                recordAsset(AssetSignal(source: .bleAdvert, identity: identity,
+                                       label: n,
+                                       rssi: r, at: now))
+                                if cachedID != p.identifier {
+                    cachedID = p.identifier
+                    DeviceCache.store(p.identifier, for: t)
+                }
+                guard let current = target else { return adopt(p) }
+                if current.state != .connected && current.identifier != p.identifier {
+                    central.cancelPeripheralConnection(current)
+                    adopt(p)
+                }
+            }
+            return
+        }
 
-        if cachedID != p.identifier {
-            cachedID = p.identifier
-            DeviceCache.store(p.identifier, for: t)
-        }
-        guard let current = target else { return adopt(p) }
-        if current.state != .connected && current.identifier != p.identifier {
-            central.cancelPeripheralConnection(current)
-            adopt(p)
-        }
+        guard recognized else { return }
+
+        let identity = "ble:\(p.identifier.uuidString)"
+        let label = name ?? "BLE"
+        recordAsset(AssetSignal(source: .bleAdvert, identity: identity,
+                               label: label, rssi: r, at: now))
     }
 
     private func continuityTypes(_ d: [String: Any]) -> Set<UInt8> {
@@ -274,7 +461,15 @@ final class Tracker: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 
     func peripheral(_ p: CBPeripheral, didReadRSSI RSSI: NSNumber, error: Error?) {
         guard error == nil else { return }
-        record(RSSI.intValue, "link")
+        let rssi = RSSI.intValue
+        guard rssi < 0, rssi > -127 else { return }
+        recordAsset(AssetSignal(
+            source: .bleLink,
+            identity: "ble:\(p.identifier.uuidString)",
+            label: p.name ?? "BLE target",
+            rssi: rssi,
+            at: Date()
+        ))
     }
 }
 

@@ -8,6 +8,8 @@ enum Style {
     static let dim = "2"
     static let green = "92"
     static let brightGreen = "1;92"
+    static let cyan = "36"
+    static let brightCyan = "1;36"
     static let yellow = "93"
     static let amber = "33"
     static let red = "91"

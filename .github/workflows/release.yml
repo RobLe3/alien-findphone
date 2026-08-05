@@ -23,7 +23,9 @@ jobs:
       - name: Package
         run: |
           cp README.md dist/
+          cp -R detector_asssets dist/
           tar -czf findphone-macos-universal.tar.gz -C dist findphone README.md
+          tar --append --file=findphone-macos-universal.tar.gz -C dist detector_asssets
           shasum -a 256 findphone-macos-universal.tar.gz | tee checksums.txt
 
       - name: Publish release
