@@ -14,18 +14,31 @@ This is a forked and adapted build of [ben-z/findphone](https://github.com/ben-z
 - Multi-source scanner surface (BLE advert/link, classic link, Wi‑Fi, and anchors).
 - Expanded tracker display with source-spectrum and distance meter output.
 
+## Original vs forked feature comparison
+
+| Feature | Original `ben-z/findphone` | `alien-findphone` fork |
+| --- | --- | --- |
+| Scanner sources | BLE adverts + direct BLE link (`readRSSI`) + classic polling | BLE adverts + BLE link + classic poll + optional Wi‑Fi + optional anchors |
+| Audio layer | Minimal/legacy tracker output | Default `alien_original_motion_tracker.m4a` atomized by distance band/spectrum/manual lock state |
+| Visual UI | Compact single-mode text list | Alien-style HUD with focus meter, range bar, sparkline, sector view, and source spectrum |
+| Manual target selection | Device name argument only | Interactive in-terminal selection (`k/j`/arrows, Enter to lock, `c` clear) |
+| Stability/selection mode | Candidate list rendered at fixed density | Adaptive HUD with tiny/compact/standard/wide layouts based on terminal size |
+| Tracking output | Best-effort RSSI + ranking | Confidence-aware candidates, focus freshness, stale markers, and sector tagging |
+| Triangulation | Not included | Optional anchor-weighted estimate (`--anchors`) + map-like sector context |
+| Defaults | Explicit CLI defaults for each mode | Audio pack defaults to `detector_asssets/alien_original_motion_tracker.m4a` unless overridden |
+
 ## Install
 
-Grab the universal binary from [Releases](https://github.com/RobLe3/alien-findphone/releases):
+Build from source locally:
 
 ```sh
-tar -xzf findphone-macos-universal.tar.gz
-xattr -dr com.apple.quarantine findphone
-./findphone --help
+git clone https://github.com/RobLe3/alien-findphone.git
+cd alien-findphone
+swift build -c release
+cp .build/release/findphone ~/bin/findphone
 ```
 
-It is unsigned, so macOS quarantines it on download; the `xattr` line clears
-that. Requires macOS 13 or later.
+Requires macOS 13 or later and the Swift toolchain from Xcode Command Line Tools.
 
 ## Build
 
@@ -34,12 +47,17 @@ swift build -c release
 cp .build/release/findphone ~/bin/findphone
 ```
 
-Requires the Swift toolchain from Xcode Command Line Tools. No dependencies.
-For a universal arm64 + x86_64 binary, which is what CI ships:
+`swift build -c release` only compiles and should not play tracker audio.
+If you still hear tracking sounds during build, an older `findphone` instance is
+still running in the background.
+Use:
 
 ```sh
-./scripts/build-universal.sh dist
+findphone --replace
 ```
+to replace the stale process before you rebuild/run again.
+
+Requires the Swift toolchain from Xcode Command Line Tools. No dependencies.
 
 ## Use
 
@@ -49,7 +67,10 @@ findphone iphone     # hunt mode: track one device by name (defaulting to on-scr
 findphone --list     # paired devices and their addresses
 ```
 
-Hunt mode defaults to alien GUI and atomized audio feedback from the default
+In interactive terminal mode, use up/down (or j/k) and Enter to lock a highlighted
+candidate, and `c` to clear manual lock.
+
+Hunt mode defaults to the alien GUI and motion-tracker sound from the default
 audio pack (`detector_asssets/alien_original_motion_tracker.m4a`), split into 5
 RSSI bands.
 Survey mode also starts the tracker output so nearby stable assets get a continuous
@@ -121,4 +142,28 @@ findphone --wifi        # force-enable Wi‑Fi (default: enabled)
 findphone --no-wifi     # disable Wi‑Fi input
 findphone --anchors     # path to JSON anchor file with optional coordinates
 findphone --audio-pack  # path to custom m4a pack for hunt audio (defaults to detector_asssets/alien_original_motion_tracker.m4a)
+findphone --replace     # stop any existing detector process and start fresh
 ```
+
+## Interactive controls
+
+- `k` / up-arrow: move highlight up
+- `j` / down-arrow: move highlight down
+- `Enter`: lock to highlighted target
+- `c`: clear manual lock
+- `q`: quit
+
+In narrow terminals (`tiny` HUD), the controls are rendered as compact symbols:
+`[↑][↓]` `↵` `c` `q` on a single menu line.
+
+## Performance notes
+
+- Use release builds for regular use (smoother rendering, tighter timer cadence):
+
+  ```sh
+  swift build -c release
+  ```
+
+- Audio atoms are discovered once at startup, then reused in memory; only mode,
+  spectrum and confidence changes alter scheduling. This keeps runtime updates
+  small and stable.

@@ -1,65 +1,107 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+#endif
 
-private let clearScreen = "\u{1B}[2J\u{1B}[H"
+private let clearScreen = "\u{1B}[0m\u{1B}[2J\u{1B}[H"
 private let margin = "    "
-private let panelWidth = 88
-private let surveyRule = String(repeating: "-", count: panelWidth)
 
 private let huntWidth = 82
-private let huntRule = Style.wrap(String(repeating: "─", count: huntWidth), Style.cyan)
-private let huntFooter = Style.wrap("  alien scanner :: move, hold still 8-12s for clearer trend", Style.dim)
 private let dBmSuffix = Style.wrap("   dBm", Style.dim)
 
-/// Indexed by Proximity.band, so the colour cannot drift from the label.
 private let bandTones = [Style.brightGreen, Style.green, Style.yellow, Style.amber, Style.red]
 private let sectors = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
 
-/// A Bluetooth public address is a stable hardware identifier, so it is worth
-/// hiding when the screen is being recorded.
 private let maskedAddress = "••:••:••:••:••:••"
 
-private let assetColumn = 22
-private let sourceColumn = 24
-private let confidenceColumn = 10
-private let distanceColumn = 8
+private let defaultAssetColumn = 22
+private let defaultSourceColumn = 24
+private let distanceColumn = 7
 private let sectorColumn = 4
+private let minAssetColumn = 10
+private let minSourceColumn = 7
 private let meterBarWidth = 52
+
+private let defaultTerminalColumns = 120
+private let defaultTerminalRows = 40
+
+private enum HudMode: Int {
+    case wide = 0, standard = 1, compact = 2, tiny = 3
+}
+
+private enum TinyDensity {
+    case normal
+    case compact
+    case ultra
+}
 
 enum Display {
     /// One write per frame; one print per frame avoids line tearing in TTY.
-    static func render(_ s: Snapshot, redact: Bool = false) {
-        let lines = s.targetName == nil ? survey(s, redact: redact) : hunt(s, redact: redact)
-        print(clearScreen + lines.joined(separator: "\n"), terminator: "\n")
+    static func render(_ s: Snapshot, redact: Bool = false, interactive: Bool = false, highlightedIdentity: String? = nil) {
+        let (columns, rows) = terminalSize()
+        let density = tinyDensity(columns: columns, rows: rows)
+        let lines = s.targetName == nil
+            ? survey(s, columns: columns, rows: rows, density: density, redact: redact, interactive: interactive, highlightedIdentity: highlightedIdentity)
+            : hunt(s, columns: columns, rows: rows, density: density, redact: redact, interactive: interactive, highlightedIdentity: highlightedIdentity)
+
+        let fitted = lines.map { clampLine($0, to: columns) }
+        let visible = fitted
+        print(clearScreen + visible.joined(separator: "\n"), terminator: "\n")
         fflush(stdout)
     }
 
-    private static func hunt(_ s: Snapshot, redact: Bool) -> [String] {
+    private static func hunt(
+        _ s: Snapshot,
+        columns: Int,
+        rows: Int,
+        density: TinyDensity,
+        redact: Bool,
+        interactive: Bool,
+        highlightedIdentity: String?
+    ) -> [String] {
+        let mode = hudMode(columns)
         let address = redact ? maskedAddress : (s.address ?? "")
         let status = "\(s.link.rawValue) · \(s.elapsed)s"
         let titleText = "[ALIEN SCAN] TRACK: \(s.targetName ?? "target")"
-        let padCount = max(1, huntWidth - titleText.count - status.count)
-        var lines = [
+        let ruleWidth = min(columns, huntWidth)
+        let padCount = max(1, ruleWidth - visibleCount(titleText) - status.count)
+        let lockState = s.isManualTracking ? Style.wrap(" [LOCKED]", Style.brightGreen) : ""
+        let lineRule = Style.wrap(String(repeating: "-", count: ruleWidth), Style.cyan)
+
+        var lines: [String] = [
             Style.wrap(titleText + String(repeating: " ", count: padCount) + status, Style.cyan),
-            huntRule,
+            lineRule,
             "",
-            "  target: \(address)",
+            "  target: \(address)\(lockState)",
             ""
         ]
 
-        lines += focusMeterLines(focus: s.focusAsset, at: s.at, readings: s.focusReadings, headline: "TRACK")
+        lines += focusMeterLines(
+            focus: s.focusAsset,
+            at: s.at,
+            readings: s.focusReadings,
+            headline: "TRACK",
+            isManualTracking: s.isManualTracking,
+            columns: columns,
+            mode: mode,
+            density: density
+        )
 
         if let issue = s.radioIssue {
             lines.append("  \(issue)")
         }
 
         if let est = s.estimate {
-            lines.append(Style.wrap("  trilateration hint: (\(fmt(est.x)), \(fmt(est.y))) conf \(percent(est.confidence))", Style.dim))
+            let estimate = "trilateration: (\(fmt(est.x)), \(fmt(est.y))) conf \(percent(est.confidence)) from \(est.sources) anchors"
+            lines.append(Style.wrap("  \(estimate)", Style.dim))
         }
 
         if let focus = s.focusAsset {
-            let estimatedDistance = formatDistance(estimatedDistanceMeters(from: focus.bestRSSI))
+            let distance = formatDistance(estimatedDistanceMeters(from: focus.bestRSSI))
             let sector = sectorTag(for: focus.identity, sources: Set(focus.sources.keys))
-            lines.append("  focus: \(estimatedDistance)m · sector \(sector)")
+            lines.append("  focus: \(distance)m · sector \(sector)")
         }
 
         lines.append("")
@@ -68,19 +110,43 @@ enum Display {
         if s.potentialAssets.isEmpty {
             lines.append("    (none yet, waiting for RSSI convergence)")
         } else {
-            for (i, asset) in s.potentialAssets.prefix(6).enumerated() {
-                lines.append(assetLine(i: i, asset: asset, now: s.at, redact: redact))
+            let shown = s.potentialAssets.prefix(idealTrackRows(rows: rows, columns: columns, mode: mode, density: density))
+            for (i, asset) in shown.enumerated() {
+                lines.append(assetLine(
+                    i: i,
+                    asset: asset,
+                    now: s.at,
+                    redact: redact,
+                    isHighlighted: interactive && asset.identity == highlightedIdentity,
+                    columns: columns,
+                    mode: mode,
+                    density: density
+                ))
             }
         }
 
-        return lines + [huntRule, huntFooter]
+        lines.append("")
+        lines.append(huntFooter(interactive: interactive, mode: mode, density: density))
+        return lines
     }
 
-    private static func survey(_ s: Snapshot, redact: Bool) -> [String] {
+    private static func survey(
+        _ s: Snapshot,
+        columns: Int,
+        rows: Int,
+        density: TinyDensity,
+        redact: Bool,
+        interactive: Bool,
+        highlightedIdentity: String?
+    ) -> [String] {
+        let mode = hudMode(columns)
+        let ruleWidth = min(columns, 88)
+        let lineRule = String(repeating: "-", count: ruleWidth)
+
         var lines = [
             Style.wrap("[ALIEN SCANNER] MULTI-SOURCE SURVEY", Style.cyan),
             Style.wrap("Live assets: \(s.deviceCount) · potential: \(s.potentialAssets.count) · elapsed \(s.elapsed)s", Style.dim),
-            surveyRule,
+            lineRule,
         ]
 
         let sourceSummary = s.sourceDistribution
@@ -102,29 +168,62 @@ enum Display {
         }
 
         lines.append("")
-        lines += focusMeterLines(focus: s.focusAsset, at: s.at, readings: s.focusReadings, headline: "FOCUS")
+        lines += focusMeterLines(
+            focus: s.focusAsset,
+            at: s.at,
+            readings: s.focusReadings,
+            headline: "FOCUS",
+            isManualTracking: s.isManualTracking,
+            columns: columns,
+            mode: mode,
+            density: density
+        )
 
         lines.append("")
         lines.append(Style.wrap("  top candidates", Style.cyan))
-        lines.append("  #  \(pad("label", assetColumn)) \(pad("src", sourceColumn)) \(pad("rssi", 6)) \(pad("conf", confidenceColumn)) \(pad("dist", distanceColumn)) \(pad("sect", sectorColumn)) age")
+        lines.append(topCandidateHeader(columns: columns, mode: mode, density: density))
 
         guard !s.assets.isEmpty else {
             lines.append("  (nothing yet — give it a few seconds)")
-            return lines + ["", "Ctrl-C to stop."]
+            lines.append("")
+            lines.append(interactive ? huntFooter(interactive: interactive, mode: mode, density: density) : "Ctrl-C to stop.")
+            return lines
         }
 
         let shown = s.potentialAssets.isEmpty ? s.assets.prefix(16) : s.potentialAssets.prefix(16)
-        for (i, asset) in shown.enumerated() {
-            lines.append(assetLine(i: i, asset: asset, now: s.at, redact: redact))
+        let limit = idealCandidateRows(rows: rows, columns: columns, mode: mode, density: density)
+        let visibleRows = Array(shown.prefix(limit))
+        for (i, asset) in visibleRows.enumerated() {
+            lines.append(assetLine(
+                i: i,
+                asset: asset,
+                now: s.at,
+                redact: redact,
+                isHighlighted: interactive && asset.identity == highlightedIdentity,
+                columns: columns,
+                mode: mode,
+                density: density
+            ))
         }
         lines.append("")
-        lines.append("Ctrl-C to stop.")
+        lines.append(huntFooter(interactive: interactive, mode: mode, density: density))
         return lines
     }
 
     private static func focusMeterLines(focus: TrackedAsset?, at: Date,
-                                      readings: [Reading], headline: String) -> [String] {
+                                      readings: [Reading], headline: String,
+                                      isManualTracking: Bool,
+                                      columns: Int,
+                                      mode: HudMode,
+                                      density: TinyDensity) -> [String] {
+        let rangeWidth = mode == .tiny ? max(10, min(32, columns - 20)) : max(12, min(40, columns - 20))
+        let barWidth = mode == .tiny ? max(12, min(26, columns - 30)) : max(20, min(meterBarWidth, columns - 30))
+        let sparkSamples = mode == .tiny ? max(8, min(24, columns - 15)) : max(12, min(44, columns - 15))
+
         var out: [String] = [Style.wrap("  \(headline) METER", Style.cyan)]
+        if isManualTracking {
+            out.append(Style.wrap("  status: locked to selected target", Style.green))
+        }
 
         guard let focus = focus else {
             out.append("  waiting for a stable asset…")
@@ -166,15 +265,20 @@ enum Display {
             label + "   " + trend,
             Style.wrap("\(margin)sectors: \(sectorDial(active: sectorIndex(for: focus.identity)))", Style.dim),
             Style.wrap("\(margin)compass: \(sectorCompass(active: sectorIndex(for: focus.identity)))", Style.dim),
-            "\(margin)range:   \(distanceNeedle(estimatedDistanceMeters(from: focus.bestRSSI), width: 40))",
+            "\(margin)range:   \(distanceNeedle(estimatedDistanceMeters(from: focus.bestRSSI), width: rangeWidth))",
             "",
-            margin + Style.wrap(bar(live, width: meterBarWidth, fill: "█", empty: "░"), tone),
+            margin + Style.wrap(bar(live, width: barWidth, fill: "█", empty: "░"), tone),
             "",
-            margin + Style.wrap(sparkline(sampleHistory.suffix(44)), Style.dim),
+            margin + Style.wrap(sparkline(sampleHistory.suffix(sparkSamples)), Style.dim),
             Style.wrap("\(margin)spark · via \(last.source) · refreshed \(ageText)s ago", Style.dim),
             Style.wrap("\(margin)peak/min \(peakText) · asset \(focus.bestRSSI) dBm", Style.dim),
             ""
         ]
+
+        if mode == .tiny {
+            out = Array(out.prefix(tinyMeterLines(density: density)))
+            out.append("")
+        }
 
         out += digits
         return out
@@ -229,20 +333,74 @@ enum Display {
         return fixed.joined(separator: " ")
     }
 
-    private static func assetLine(i: Int, asset: TrackedAsset, now: Date, redact: Bool) -> String {
-        let label = redact ? redactLabel(asset.label, maxLen: assetColumn) : pad(asset.label, assetColumn)
-        let sources = asset.sources.keys
-            .map(\.rawValue)
-            .sorted()
-            .joined(separator: ",")
-        let sourceSnippet = pad(String(sources.prefix(sourceColumn)), sourceColumn)
+    private static func topCandidateHeader(columns: Int, mode: HudMode, density: TinyDensity) -> String {
+        switch mode {
+        case .wide, .standard:
+            let cols = assetColumns(columns: columns)
+            return "  #  \(fit("label", cols.labelWidth, alignment: .left)) " +
+                "\(fit("src", cols.sourceWidth, alignment: .left)) " +
+                "\(fit("rssi", cols.rssiWidth, alignment: .right)) " +
+                "\(fit("conf", cols.confWidth, alignment: .right)) " +
+                "\(fit("dist", cols.distWidth, alignment: .right)) " +
+                "\(fit("sect", cols.sectorWidth, alignment: .right)) age"
+        case .compact:
+            return "  #  \(fit("label", 18, alignment: .left)) \(fit("rssi", 6, alignment: .right)) \(fit("dist", 7, alignment: .right)) \(fit("sect", 3, alignment: .right)) age"
+        case .tiny:
+            let cols = tinyColumns(columns: columns, density: density)
+            return "  #  \(fit("label", cols.labelWidth, alignment: .left)) " +
+                "\(fit("rssi", cols.rssiWidth, alignment: .right)) " +
+                "\(fit(cols.ageLabel, cols.ageWidth, alignment: .right))"
+        }
+    }
+
+    private static func assetLine(
+        i: Int,
+        asset: TrackedAsset,
+        now: Date,
+        redact: Bool,
+        isHighlighted: Bool,
+        columns: Int,
+        mode: HudMode,
+        density: TinyDensity
+    ) -> String {
+        let marker = isHighlighted ? ">" : " "
         let conf = percent(asset.confidence(now: now))
         let distance = formatDistance(estimatedDistanceMeters(from: asset.bestRSSI))
         let sector = sectorTag(for: asset.identity, sources: Set(asset.sources.keys))
-        let stale = now.timeIntervalSince(asset.last) > 7
         let age = Int(now.timeIntervalSince(asset.last).rounded())
-        let staleSuffix = stale ? "  stale" : ""
-        return "  \(pad(String(i + 1), 2)). \(label) \(sourceSnippet)  \(pad(String(asset.bestRSSI), 6))  \(pad(conf, confidenceColumn))  \(pad("\(distance)m", distanceColumn))  \(pad(sector, sectorColumn)) \(age)s\(staleSuffix)"
+        let stale = now.timeIntervalSince(asset.last) > 7
+        let ageText = "\(age)s" + (stale ? " stale" : "")
+
+        switch mode {
+        case .wide, .standard:
+            let cols = assetColumns(columns: columns)
+            let label = redact ? redactLabel(asset.label, maxLen: cols.labelWidth) : fit(asset.label, cols.labelWidth, alignment: .left)
+            let sources = asset.sources.keys
+                .map(\.rawValue)
+                .sorted()
+                .joined(separator: ",")
+            let sourceText = fit(String(sources), cols.sourceWidth, alignment: .left)
+
+            return "  \(marker) \(fit(String(i + 1), 2)). \(label) \(sourceText) " +
+                " \(fit(String(asset.bestRSSI), cols.rssiWidth, alignment: .right)) " +
+                "\(fit(conf, cols.confWidth, alignment: .right)) " +
+                "\(fit("\(distance)m", cols.distWidth, alignment: .right)) " +
+                "\(fit(sector, cols.sectorWidth, alignment: .right)) \(ageText)"
+
+        case .compact:
+            let label = redact ? redactLabel(asset.label, maxLen: 18) : fit(asset.label, 18, alignment: .left)
+            return "  \(marker) \(fit(String(i + 1), 2)). \(label) " +
+                "\(fit(String(asset.bestRSSI), 6, alignment: .right)) " +
+                "\(fit("\(distance)m", 7, alignment: .right)) " +
+                "\(fit(sector, 3, alignment: .right)) \(ageText)"
+
+        case .tiny:
+            let cols = tinyColumns(columns: columns, density: density)
+            let label = redact ? redactLabel(asset.label, maxLen: cols.labelWidth) : fit(asset.label, cols.labelWidth, alignment: .left)
+            return "  \(marker) \(fit(String(i + 1), 2)). \(label) " +
+                "\(fit(String(asset.bestRSSI), cols.rssiWidth, alignment: .right)) " +
+                "\(fit(tinyAgeText(age, stale: stale, density: density), cols.ageWidth, alignment: .right))"
+        }
     }
 
     private static func fmt(_ v: Double) -> String {
@@ -255,7 +413,7 @@ enum Display {
 
     private static func redactLabel(_ label: String, maxLen: Int) -> String {
         if maxLen < 2 { return String(label.prefix(maxLen)) }
-        return pad("█" + String(label.dropFirst()), maxLen)
+        return fit("█" + String(label.dropFirst()), maxLen)
     }
 
     private static func sourceSummaryTagLine(_ distribution: [SignalSource: Int]) -> String {
@@ -281,5 +439,274 @@ enum Display {
                   + (d.connected ? "connected" : "not connected"))
         }
         print("\nTrack one with:  findphone <name>")
+    }
+
+    private static func huntFooter(interactive: Bool, mode: HudMode, density: TinyDensity) -> String {
+        guard interactive else {
+            return "q or Ctrl-C to stop."
+        }
+
+        switch mode {
+        case .wide, .standard:
+            return "  MENU: up(k) / down(j), enter lock, c clear, q/ Ctrl-C to stop"
+        case .compact:
+            return "  MENU: k/j move, enter lock, c clear, q/ Ctrl-C to stop"
+        case .tiny:
+            return tinyMenuLine(density: density)
+        }
+    }
+
+    private static func hudMode(_ columns: Int) -> HudMode {
+        if columns >= 96 {
+            return .wide
+        }
+        if columns >= 74 {
+            return .standard
+        }
+        if columns >= 62 {
+            return .compact
+        }
+        return .tiny
+    }
+
+    private static func terminalSize() -> (columns: Int, rows: Int) {
+        let envCols = Int(ProcessInfo.processInfo.environment["COLUMNS"] ?? "") ?? 0
+        let envRows = Int(ProcessInfo.processInfo.environment["LINES"] ?? "") ?? 0
+
+        var wins = winsize()
+        var width = max(0, envCols)
+        var height = max(0, envRows)
+        #if canImport(Darwin)
+        if ioctl(STDOUT_FILENO, TIOCGWINSZ, &wins) == 0, wins.ws_col > 0 {
+            width = Int(wins.ws_col)
+            height = Int(wins.ws_row)
+        }
+        #else
+        if ioctl(STDOUT_FILENO, TIOCGWINSZ, &wins) == 0, wins.ws_col > 0 {
+            width = Int(wins.ws_col)
+            height = Int(wins.ws_row)
+        }
+        #endif
+
+        if width == 0 {
+            width = defaultTerminalColumns
+        }
+        if height == 0 {
+            height = defaultTerminalRows
+        }
+
+        let terminalColumns = max(0, width)
+        let terminalRows = max(0, height)
+
+        if terminalColumns > 0 && terminalRows > 0 {
+            return (terminalColumns, terminalRows)
+        }
+        if terminalColumns > 0 {
+            return (terminalColumns, 30)
+        }
+        if terminalRows > 0 {
+            return (100, terminalRows)
+        }
+        return (100, 30)
+    }
+
+    private static func idealTrackRows(rows: Int, columns: Int, mode: HudMode, density: TinyDensity) -> Int {
+        switch mode {
+        case .wide:
+            return max(2, min(10, rows - 14))
+        case .standard:
+            return max(2, min(8, rows - 16))
+        case .compact:
+            return max(2, min(6, rows - 18))
+        case .tiny:
+            return tinyTrackRows(rows: rows, density: density)
+        }
+    }
+
+    private static func idealCandidateRows(rows: Int, columns: Int, mode: HudMode, density: TinyDensity) -> Int {
+        switch mode {
+        case .wide:
+            return max(5, min(16, rows - 22))
+        case .standard:
+            return max(5, min(14, rows - 24))
+        case .compact:
+            return max(4, min(12, rows - 25))
+        case .tiny:
+            return tinyCandidateRows(rows: rows, density: density)
+        }
+    }
+
+    private static func tinyDensity(columns: Int, rows: Int) -> TinyDensity {
+        if columns <= 46 || rows <= 22 {
+            return .ultra
+        }
+        if columns <= 55 || rows <= 25 {
+            return .compact
+        }
+        return .normal
+    }
+
+    private static func tinyColumns(columns: Int, density: TinyDensity) -> (labelWidth: Int, rssiWidth: Int, ageWidth: Int, ageLabel: String) {
+        let rssiWidth = density == .normal ? 6 : 5
+        let ageWidth = density == .normal ? 5 : 4
+        let ageLabel = density == .normal ? "age" : "A"
+        let minLabel = density == .normal ? 10 : 8
+        let fixed = 8 + rssiWidth + 1 + ageWidth
+        let labelWidth = columns > fixed ? columns - fixed : minLabel
+
+        return (
+            labelWidth: max(minLabel, min(labelWidth, density == .normal ? 14 : 11)),
+            rssiWidth: rssiWidth,
+            ageWidth: ageWidth,
+            ageLabel: ageLabel
+        )
+    }
+
+    private static func tinyAgeText(_ seconds: Int, stale: Bool, density: TinyDensity) -> String {
+        let staleSuffix = stale ? (density == .normal ? "*" : "#") : ""
+        return "\(seconds)s\(staleSuffix)"
+    }
+
+    private static func tinyMenuLine(density: TinyDensity, compact: Bool = false) -> String {
+        switch density {
+        case .normal:
+            return compact
+                ? "  [U][D] [Enter] [c] [q]"
+                : "  MENU: [U][D]=move, [Enter]=lock, [c]=clear, [q]=quit"
+        case .compact:
+            return compact
+                ? " [U][D] [E] [c] [q]"
+                : " MENU: [U][D] [E] [c] [q]"
+        case .ultra:
+            return compact ? "  U D E c q" : "  U=up D=down E=lock c=clear q=quit"
+        }
+    }
+
+    private static func tinyMeterLines(density: TinyDensity) -> Int {
+        switch density {
+        case .normal:
+            return 8
+        case .compact:
+            return 7
+        case .ultra:
+            return 6
+        }
+    }
+
+    private static func tinyTrackRows(rows: Int, density: TinyDensity) -> Int {
+        let maxRows = density == .normal ? 3 : (density == .compact ? 2 : 1)
+        let base = density == .normal ? 16 : (density == .compact ? 17 : 19)
+        let available = max(0, rows - base)
+        return max(1, min(maxRows, available))
+    }
+
+    private static func tinyCandidateRows(rows: Int, density: TinyDensity) -> Int {
+        let maxRows = density == .normal ? 8 : (density == .compact ? 6 : 4)
+        let base = density == .normal ? 18 : (density == .compact ? 20 : 22)
+        let available = max(0, rows - base)
+        return max(1, min(maxRows, available))
+    }
+
+    private struct AssetColumnPlan {
+        let labelWidth: Int
+        let sourceWidth: Int
+        let rssiWidth: Int
+        let confWidth: Int
+        let distWidth: Int
+        let sectorWidth: Int
+    }
+
+    private static func assetColumns(columns: Int) -> AssetColumnPlan {
+        let reserved = 2 /*prefix and idx*/
+            + 1 /*sp*/
+            + 1 /*dot*/
+            + 1 /*space after index*/
+            + 1 /*separator*/
+            + 2 /*rssi gap*/
+            + 2 /*conf gap*/
+            + 2 /*dist gap*/
+            + 2 /*sect gap*/
+            + 1 /*stale/age*/
+            + 8 /*age column*/
+
+        let minLabel = minAssetColumn
+        let minSource = minSourceColumn
+        let dynamic = max(0, columns - reserved - 6 - 6 - distanceColumn - sectorColumn)
+        let targetLabel = max(minLabel, min(defaultAssetColumn, dynamic * 5 / 8))
+        let targetSource = max(minSource, dynamic - targetLabel)
+
+        return AssetColumnPlan(
+            labelWidth: targetLabel,
+            sourceWidth: targetSource,
+            rssiWidth: 6,
+            confWidth: 6,
+            distWidth: distanceColumn,
+            sectorWidth: sectorColumn
+        )
+    }
+
+    private enum Align {
+        case left, right
+    }
+
+    private static func fit(_ value: String, _ width: Int, alignment: Align = .left) -> String {
+        if width <= 0 { return "" }
+        let truncated = value.count > width ? String(value.prefix(width)) : value
+        switch alignment {
+        case .left:
+            return truncated.padding(toLength: width, withPad: " ", startingAt: 0)
+        case .right:
+            return String(repeating: " ", count: max(0, width - truncated.count)) + truncated
+        }
+    }
+
+    private static func visibleCount(_ value: String) -> Int {
+        value.reduce(0) { count, _ in count + 1 }
+    }
+
+    private static func clampLine(_ text: String, to columns: Int) -> String {
+        if columns <= 0 { return "" }
+        var out = ""
+        var visible = 0
+        var index = text.startIndex
+        var styleOpen = false
+
+        while index < text.endIndex && visible < columns {
+            if text[index] == "\u{1B}" {
+                let next = text.index(after: index)
+                if next < text.endIndex && text[next] == "[" {
+                    var end = next
+                    while end < text.endIndex, text[end] != "m" {
+                        end = text.index(after: end)
+                    }
+                    if end < text.endIndex {
+                        let sequence = text[index...end]
+                        out += sequence
+                        if sequence.hasSuffix("[0m") || sequence.hasSuffix("[39m") || sequence.hasSuffix("[49m") {
+                            styleOpen = false
+                        } else {
+                            styleOpen = true
+                        }
+                        index = text.index(after: end)
+                        continue
+                    }
+                }
+
+                out.append(text[index])
+                visible += 1
+                index = next
+                continue
+            }
+
+            let ch = text[index]
+            out.append(ch)
+            visible += 1
+            index = text.index(after: index)
+        }
+
+        if styleOpen && index < text.endIndex {
+            out += "\u{1B}[0m"
+        }
+        return out
     }
 }
