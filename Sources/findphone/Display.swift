@@ -12,14 +12,11 @@ private let huntWidth = 82
 private let dBmSuffix = Style.wrap("   dBm", Style.dim)
 
 private let bandTones = [Style.brightGreen, Style.green, Style.yellow, Style.amber, Style.red]
-private let sectors = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
-
 private let maskedAddress = "••:••:••:••:••:••"
 
 private let defaultAssetColumn = 22
 private let defaultSourceColumn = 24
 private let distanceColumn = 7
-private let sectorColumn = 4
 private let minAssetColumn = 10
 private let minSourceColumn = 7
 private let meterBarWidth = 52
@@ -99,8 +96,7 @@ enum Display {
 
         if let focus = s.focusAsset {
             let distance = formatDistance(estimatedDistanceMeters(from: focus.bestRSSI))
-            let sector = sectorTag(for: focus.identity, sources: Set(focus.sources.keys))
-            lines.append("  focus: \(distance)m · sector \(sector)")
+            lines.append("  focus: \(distance)m")
         }
 
         lines.append("")
@@ -234,9 +230,8 @@ enum Display {
         let age = Int(at.timeIntervalSince(focus.last).rounded())
         let stale = age > 7 ? Style.wrap("  stale", Style.amber) : ""
         let distance = formatDistance(estimatedDistanceMeters(from: focus.bestRSSI))
-        let sector = sectorTag(for: focus.identity, sources: Set(focus.sources.keys))
         out.append("  \(focus.label) · \(sourceTags) · conf \(conf)")
-        out.append("  dist \(distance)m · sector \(sector) · age \(age)s\(stale)")
+        out.append("  dist \(distance)m · age \(age)s\(stale)")
 
         let sampleHistory = readings.isEmpty
             ? [Reading(rssi: focus.bestRSSI, at: focus.last, source: focus.mostRecentSource?.rawValue ?? "")] : readings
@@ -262,8 +257,6 @@ enum Display {
         out += [
             "",
             label + "   " + trend,
-            Style.wrap("\(margin)sectors: \(sectorDial(active: sectorIndex(for: focus.identity)))", Style.dim),
-            Style.wrap("\(margin)compass: \(sectorCompass(active: sectorIndex(for: focus.identity)))", Style.dim),
             "\(margin)range:   \(distanceNeedle(estimatedDistanceMeters(from: focus.bestRSSI), width: rangeWidth))",
             "",
             margin + Style.wrap(bar(live, width: barWidth, fill: "█", empty: "░"), tone),
@@ -292,44 +285,12 @@ enum Display {
         }
     }
 
-    private static func sectorIndex(for identity: String) -> Int {
-        let sum = identity.utf8.reduce(0) { acc, b in acc + Int(b) }
-        return sectors.isEmpty ? 0 : sum % sectors.count
-    }
-
-    private static func sectorCompass(active: Int) -> String {
-        guard !sectors.isEmpty else { return "--" }
-        return sectors.indices.map { idx in
-            if idx == active % sectors.count {
-                return "[\(sectors[idx])]"
-            }
-            return " \(sectors[idx]) "
-        }.joined(separator: " ")
-    }
-
     private static func distanceNeedle(_ distance: Double, width: Int = 30) -> String {
         let maxMeters = 12.0
         let clamped = max(0.0, min(maxMeters, distance))
         let fill = Int((1.0 - (clamped / maxMeters)) * Double(width))
         let empty = max(0, width - fill)
         return String(repeating: "█", count: fill) + String(repeating: "░", count: empty)
-    }
-
-    private static func sectorTag(for identity: String, sources: Set<SignalSource>) -> String {
-        guard !sectors.isEmpty else { return "--" }
-        if !sources.isEmpty {
-            let sourceBias = sources.map(\.rawValue).joined(separator: "+")
-            return sectors[sectorIndex(for: "\(identity)|\(sourceBias)")]
-        }
-        return sectors[sectorIndex(for: identity)]
-    }
-
-    private static func sectorDial(active: Int) -> String {
-        guard !sectors.isEmpty else { return "--" }
-        let fixed = sectors.enumerated().map { idx, value in
-            idx == active % sectors.count ? "[\(value)]" : " \(value) "
-        }
-        return fixed.joined(separator: " ")
     }
 
     private static func topCandidateHeader(columns: Int, mode: HudMode, density: TinyDensity) -> String {
@@ -340,10 +301,9 @@ enum Display {
                 "\(fit("src", cols.sourceWidth, alignment: .left)) " +
                 "\(fit("rssi", cols.rssiWidth, alignment: .right)) " +
                 "\(fit("conf", cols.confWidth, alignment: .right)) " +
-                "\(fit("dist", cols.distWidth, alignment: .right)) " +
-                "\(fit("sect", cols.sectorWidth, alignment: .right)) age"
+                "\(fit("dist", cols.distWidth, alignment: .right)) age"
         case .compact:
-            return "  #  \(fit("label", 18, alignment: .left)) \(fit("rssi", 6, alignment: .right)) \(fit("dist", 7, alignment: .right)) \(fit("sect", 3, alignment: .right)) age"
+            return "  #  \(fit("label", 18, alignment: .left)) \(fit("rssi", 6, alignment: .right)) \(fit("dist", 7, alignment: .right)) age"
         case .tiny:
             let cols = tinyColumns(columns: columns, density: density)
             return "  #  \(fit("label", cols.labelWidth, alignment: .left)) " +
@@ -365,7 +325,6 @@ enum Display {
         let marker = isHighlighted ? ">" : " "
         let conf = percent(asset.confidence(now: now))
         let distance = formatDistance(estimatedDistanceMeters(from: asset.bestRSSI))
-        let sector = sectorTag(for: asset.identity, sources: Set(asset.sources.keys))
         let age = Int(now.timeIntervalSince(asset.last).rounded())
         let stale = now.timeIntervalSince(asset.last) > 7
         let ageText = "\(age)s" + (stale ? " stale" : "")
@@ -383,15 +342,13 @@ enum Display {
             return "  \(marker) \(fit(String(i + 1), 2)). \(label) \(sourceText) " +
                 " \(fit(String(asset.bestRSSI), cols.rssiWidth, alignment: .right)) " +
                 "\(fit(conf, cols.confWidth, alignment: .right)) " +
-                "\(fit("\(distance)m", cols.distWidth, alignment: .right)) " +
-                "\(fit(sector, cols.sectorWidth, alignment: .right)) \(ageText)"
+                "\(fit("\(distance)m", cols.distWidth, alignment: .right)) \(ageText)"
 
         case .compact:
             let label = redact ? redactLabel(asset.label, maxLen: 18) : fit(asset.label, 18, alignment: .left)
             return "  \(marker) \(fit(String(i + 1), 2)). \(label) " +
                 "\(fit(String(asset.bestRSSI), 6, alignment: .right)) " +
-                "\(fit("\(distance)m", 7, alignment: .right)) " +
-                "\(fit(sector, 3, alignment: .right)) \(ageText)"
+                "\(fit("\(distance)m", 7, alignment: .right)) \(ageText)"
 
         case .tiny:
             let cols = tinyColumns(columns: columns, density: density)
@@ -632,7 +589,6 @@ enum Display {
         let rssiWidth: Int
         let confWidth: Int
         let distWidth: Int
-        let sectorWidth: Int
     }
 
     private static func assetColumns(columns: Int) -> AssetColumnPlan {
@@ -644,13 +600,12 @@ enum Display {
             + 2 /*rssi gap*/
             + 2 /*conf gap*/
             + 2 /*dist gap*/
-            + 2 /*sect gap*/
             + 1 /*stale/age*/
             + 8 /*age column*/
 
         let minLabel = minAssetColumn
         let minSource = minSourceColumn
-        let dynamic = max(0, columns - reserved - 6 - 6 - distanceColumn - sectorColumn)
+        let dynamic = max(0, columns - reserved - 6 - 6 - distanceColumn)
         let targetLabel = max(minLabel, min(defaultAssetColumn, dynamic * 5 / 8))
         let targetSource = max(minSource, dynamic - targetLabel)
 
@@ -660,7 +615,6 @@ enum Display {
             rssiWidth: 6,
             confWidth: 6,
             distWidth: distanceColumn,
-            sectorWidth: sectorColumn
         )
     }
 
