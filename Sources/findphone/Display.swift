@@ -46,8 +46,8 @@ enum Display {
             ? survey(s, columns: columns, rows: rows, density: density, redact: redact, interactive: interactive, highlightedIdentity: highlightedIdentity)
             : hunt(s, columns: columns, rows: rows, density: density, redact: redact, interactive: interactive, highlightedIdentity: highlightedIdentity)
 
-        let visible = lines
-        print(clearScreen + visible.joined(separator: "\n"), terminator: "\n")
+        let fitted = lines.map { clampLine($0, to: columns) }
+        print(clearScreen + fitted.joined(separator: "\n"), terminator: "\n")
         fflush(stdout)
     }
 
@@ -705,6 +705,76 @@ enum Display {
     }
 
     private static func visibleCount(_ value: String) -> Int {
-        value.count
+        var count = 0
+        var index = value.startIndex
+        while index < value.endIndex {
+            if value[index] == "\u{1B}" {
+                let next = value.index(after: index)
+                if next < value.endIndex && value[next] == "[" {
+                    var end = next
+                    while end < value.endIndex && value[end] != "m" {
+                        end = value.index(after: end)
+                    }
+                    if end < value.endIndex {
+                        index = value.index(after: end)
+                        continue
+                    }
+                }
+            }
+            count += 1
+            index = value.index(after: index)
+        }
+        return count
+    }
+
+    private static func clampLine(_ text: String, to columns: Int) -> String {
+        if columns <= 0 { return "" }
+        var out = ""
+        var visible = 0
+        var index = text.startIndex
+        var styleOpen = false
+
+        while index < text.endIndex && visible < columns {
+            let char = text[index]
+            if char == "\u{1B}" {
+                let next = text.index(after: index)
+                if next < text.endIndex && text[next] == "[" {
+                    var end = next
+                    while end < text.endIndex && text[end] != "m" {
+                        end = text.index(after: end)
+                    }
+                    if end < text.endIndex {
+                        let sequence = text[index...end]
+                        out += sequence
+                        let payload = String(text[text.index(after: next)..<end])
+                        if shouldResetStyle(payload) {
+                            styleOpen = false
+                        } else {
+                            styleOpen = true
+                        }
+                        index = text.index(after: end)
+                        continue
+                    }
+                }
+            }
+
+            out.append(char)
+            visible += 1
+            index = text.index(after: index)
+        }
+
+        if styleOpen {
+            out += "\u{1B}[0m"
+        }
+        return out
+    }
+
+    private static func shouldResetStyle(_ payload: String) -> Bool {
+        let codes = payload
+            .split(separator: ";")
+            .compactMap { Int($0) }
+
+        guard !codes.isEmpty else { return false }
+        return codes.contains(0) || codes.contains(39) || codes.contains(49)
     }
 }
