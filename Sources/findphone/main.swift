@@ -1,52 +1,89 @@
 import Foundation
 
-let usage = """
-findphone — locate a nearby Bluetooth device by signal strength
+private func printUsageAndExit() -> Never {
+    print(usageText)
+    exit(0)
+}
 
-  findphone            survey every nearby Apple handheld
-  findphone <name>     track one device by name (case-insensitive)
-  findphone --list     show paired devices and their addresses
+func selectCandidate(tracker: Tracker, redact: Bool) -> String? {
+    let interval = 1.0
 
-  --sound              click faster as you get closer (hunt mode)
-  --redact             mask Bluetooth addresses, for screen recording
-"""
+    while true {
+        let snapshot = tracker.snapshot()
 
-let knownFlags: Set<String> = ["-h", "--help", "--list", "--redact", "--sound"]
+        if snapshot.candidates.isEmpty {
+            print("Nearby Apple handhelds — no candidates yet")
+            print("Waiting for nearby devices... (or press q to quit)")
+            if let input = readLine(strippingNewline: true), input.lowercased() == "q" {
+                return nil
+            }
+            sleep(UInt32(interval))
+            continue
+        }
 
-func usageError(_ message: String) -> Never {
-    FileHandle.standardError.write(Data("findphone: \(message)\n\n\(usage)\n".utf8))
-    exit(2)
+        print("Nearby Apple handhelds — select one to track:\n")
+        for (index, candidate) in snapshot.candidates.enumerated() {
+            let live = Int(candidate.smoothed.rounded())
+            let stale = snapshot.at.timeIntervalSince(candidate.last) > 3 ? " (stale)" : ""
+            let name = redact ? candidate.kind : candidate.label
+            let line = String(format: "%2d. %@ %4d dBm  peak %4d", index + 1, bar(live), live, candidate.peak)
+            print("\(line)  \(name)\(stale)")
+        }
+
+        print("Select a device number, or q to quit: ", terminator: "")
+        guard let raw = readLine(strippingNewline: true) else { return nil }
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if value.lowercased() == "q" {
+            return nil
+        }
+
+        guard let selected = Int(value), selected > 0, selected <= snapshot.candidates.count else {
+            print("Invalid selection. Enter 1 through \(snapshot.candidates.count), or q to quit.")
+            sleep(1)
+            continue
+        }
+
+        return snapshot.candidates[selected - 1].identity
+    }
 }
 
 let args = CommandLine.arguments.dropFirst()
+let parsed: ParsedArguments
 
-if args.contains("-h") || args.contains("--help") {
-    print(usage)
-    exit(0)
-}
-
-if let unknown = args.first(where: { $0.hasPrefix("-") && !knownFlags.contains($0) }) {
-    usageError("unknown option '\(unknown)'")
-}
-
-let names = args.filter { !$0.hasPrefix("-") }
-if names.count > 1 {
-    usageError("expected one device name, got \(names.count): \(names.joined(separator: ", "))")
-}
-
-let redact = args.contains("--redact")
-
-if args.contains("--list") {
-    Display.list(Classic.devicesByStrength(), redact: redact)
-    exit(0)
-}
-
-/// Clicks only make sense with a single target; survey mode tracks many.
-var clicker: Clicker?
-if args.contains("--sound") {
-    if names.isEmpty {
+do {
+    parsed = try parseArguments(args)
+} catch let error as ParseError {
+    switch error {
+    case .unknownFlag(let flag):
+        usageError("unknown option '\(flag)'")
+    case .tooManyNames(let count):
+        usageError("expected one device name, got \(count)")
+    case .selectWithName:
+        usageError("--select does not take a device name")
+    case .missingNameForSound:
         usageError("--sound needs a device name to track")
+    case .selectWithList:
+        usageError("--select and --list are mutually exclusive")
     }
+} catch {
+    usageError("failed to parse arguments")
+}
+
+if parsed.wantsHelp {
+    printUsageAndExit()
+}
+
+if parsed.wantsList {
+    Display.list(Classic.devicesByStrength(), redact: parsed.redact)
+    exit(0)
+}
+
+let tracker = Tracker(targetName: parsed.targetName)
+tracker.start()
+
+var clicker: Clicker?
+if parsed.wantsSound {
     clicker = Clicker()
     if let clicker {
         clicker.start()
@@ -55,13 +92,20 @@ if args.contains("--sound") {
     }
 }
 
-let tracker = Tracker(targetName: names.first)
-tracker.start()
+if parsed.wantsSelect {
+    guard let selectedIdentity = selectCandidate(tracker: tracker, redact: parsed.redact) else {
+        print("No selection made.")
+        exit(0)
+    }
+    tracker.setManualSelection(identity: selectedIdentity)
+}
 
-Timer.scheduledTimer(withTimeInterval: names.isEmpty ? 1.0 : 0.25, repeats: true) { _ in
+let renderInterval = parsed.targetName == nil && !parsed.wantsSelect ? 1.0 : 0.25
+Timer.scheduledTimer(withTimeInterval: renderInterval, repeats: true) { _ in
     let snapshot = tracker.snapshot()
-    Display.render(snapshot, redact: redact)
-    clicker?.update(rssi: snapshot.isFresh ? snapshot.live : nil)
+    Display.render(snapshot, redact: parsed.redact)
+    let value = snapshot.effectiveFresh ? snapshot.effectiveLive : nil
+    clicker?.update(rssi: value)
 }
 
 RunLoop.main.run()
