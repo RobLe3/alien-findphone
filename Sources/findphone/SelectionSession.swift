@@ -1,64 +1,88 @@
 import Foundation
 
+typealias SelectionInputReader = () -> String?
+
 final class ManualSelectionSession {
-    private let tracker: Tracker
+    private let readInput: SelectionInputReader
+    private let snapshotProvider: () -> ([Advertiser], Date)
     private let redact: Bool
     private let onCompletion: (String?) -> Void
+    private let inputQueue: DispatchQueue
+    private let renderInterval: TimeInterval
 
     private var isActive = true
     private var selectedCandidates: [Advertiser] = []
     private var refreshTimer: Timer?
+    private var isInputPending = false
 
-    init(tracker: Tracker, redact: Bool, onCompletion: @escaping (String?) -> Void) {
-        self.tracker = tracker
+    init(
+        tracker: Tracker,
+        redact: Bool,
+        onCompletion: @escaping (String?) -> Void,
+        readInput: @escaping SelectionInputReader = { readLine(strippingNewline: true) },
+        inputQueue: DispatchQueue = DispatchQueue(label: "findphone.selection.input"),
+        renderInterval: TimeInterval = 1.0
+    ) {
+        self.snapshotProvider = {
+            let snapshot = tracker.snapshot()
+            return (snapshot.candidates, snapshot.at)
+        }
         self.redact = redact
         self.onCompletion = onCompletion
+        self.readInput = readInput
+        self.inputQueue = inputQueue
+        self.renderInterval = renderInterval
     }
 
-    func start() {
-        startInputReader()
+    /// Test-only initializer.
+    init(
+        snapshotProvider: @escaping () -> ([Advertiser], Date),
+        redact: Bool,
+        onCompletion: @escaping (String?) -> Void,
+        readInput: @escaping SelectionInputReader = { readLine(strippingNewline: true) },
+        inputQueue: DispatchQueue = DispatchQueue(label: "findphone.selection.input"),
+        renderInterval: TimeInterval = 1.0
+    ) {
+        self.snapshotProvider = snapshotProvider
+        self.redact = redact
+        self.onCompletion = onCompletion
+        self.readInput = readInput
+        self.inputQueue = inputQueue
+        self.renderInterval = renderInterval
+    }
+
+    func start(inputEnabled: Bool = true) {
+        guard isActive else { return }
+        requestInput()
         refreshAndRender()
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+        guard inputEnabled else { return }
+
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: renderInterval, repeats: true) { [weak self] _ in
             self?.refreshAndRender()
         }
     }
 
-    private func startInputReader() {
-        DispatchQueue(label: "findphone.selection.input").async { [weak self] in
-            while true {
-                if let raw = readLine(strippingNewline: true) {
-                    DispatchQueue.main.async {
-                        self?.handle(input: raw)
-                    }
-                } else {
-                    DispatchQueue.main.async {
-                        self?.complete(with: nil)
-                    }
-                    return
-                }
+    func requestInput() {
+        guard isActive, !isInputPending else { return }
+        isInputPending = true
+
+        inputQueue.async { [weak self] in
+            guard let self else { return }
+            let rawInput = self.readInput()
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.isInputPending = false
+                self.handle(input: rawInput)
             }
         }
     }
 
-    private func handle(input: String) {
+    func refreshAndRender() {
         guard isActive else { return }
 
-        let outcome = CandidateSelectionResolver.resolve(rawInput: input, candidates: selectedCandidates)
-        switch outcome {
-        case .quit:
-            complete(with: nil)
-        case .invalid:
-            print("Invalid selection. Enter 1 through \(selectedCandidates.count), or q to quit.")
-        case let .selectedIdentity(identity):
-            complete(with: identity)
-        }
-    }
-
-    private func refreshAndRender() {
-        guard isActive else { return }
-
-        let snapshot = tracker.snapshot()
-        selectedCandidates = snapshot.candidates
+        let (candidates, snapshotAt) = snapshotProvider()
+        selectedCandidates = candidates
 
         if selectedCandidates.isEmpty {
             print("Nearby Apple handhelds — no candidates yet")
@@ -69,7 +93,7 @@ final class ManualSelectionSession {
         print("Nearby Apple handhelds — select one to track:\n")
         for (index, candidate) in selectedCandidates.enumerated() {
             let live = Int(candidate.smoothed.rounded())
-            let stale = snapshot.at.timeIntervalSince(candidate.last) > 3 ? " (stale)" : ""
+            let stale = snapshotAt.timeIntervalSince(candidate.last) > 3 ? " (stale)" : ""
             let name = redact ? candidate.kind : candidate.label
             let line = String(format: "%2d. %@ %4d dBm  peak %4d", index + 1, bar(live), live, candidate.peak)
             print("\(line)  \(name)\(stale)")
@@ -78,9 +102,30 @@ final class ManualSelectionSession {
         print("Select a device number, or q to quit: ", terminator: "")
     }
 
+    private func handle(input: String?) {
+        guard isActive else { return }
+
+        guard let rawInput = input else {
+            complete(with: nil)
+            return
+        }
+
+        let outcome = CandidateSelectionResolver.resolve(rawInput: rawInput, candidates: selectedCandidates)
+        switch outcome {
+        case .quit:
+            complete(with: nil)
+        case .invalid:
+            print("Invalid selection. Enter 1 through \(selectedCandidates.count), or q to quit.")
+            requestInput()
+        case let .selectedIdentity(identity):
+            complete(with: identity)
+        }
+    }
+
     private func complete(with identity: String?) {
         guard isActive else { return }
         isActive = false
+        isInputPending = false
         refreshTimer?.invalidate()
         onCompletion(identity)
     }
