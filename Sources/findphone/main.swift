@@ -5,48 +5,6 @@ private func printUsageAndExit() -> Never {
     exit(0)
 }
 
-func selectCandidate(tracker: Tracker, redact: Bool) -> String? {
-    let interval = 1.0
-
-    while true {
-        let snapshot = tracker.snapshot()
-        let displayedCandidates = snapshot.candidates
-
-        if displayedCandidates.isEmpty {
-            print("Nearby Apple handhelds — no candidates yet")
-            print("Waiting for nearby devices... (or press q to quit)")
-            if let input = readLine(strippingNewline: true), input.lowercased() == "q" {
-                return nil
-            }
-            sleep(UInt32(interval))
-            continue
-        }
-
-        print("Nearby Apple handhelds — select one to track:\n")
-        for (index, candidate) in displayedCandidates.enumerated() {
-            let live = Int(candidate.smoothed.rounded())
-            let stale = snapshot.at.timeIntervalSince(candidate.last) > 3 ? " (stale)" : ""
-            let name = redact ? candidate.kind : candidate.label
-            let line = String(format: "%2d. %@ %4d dBm  peak %4d", index + 1, bar(live), live, candidate.peak)
-            print("\(line)  \(name)\(stale)")
-        }
-
-        print("Select a device number, or q to quit: ", terminator: "")
-        guard let raw = readLine(strippingNewline: true) else { return nil }
-
-        switch CandidateSelectionResolver.resolve(rawInput: raw, candidates: displayedCandidates) {
-        case .quit:
-            return nil
-        case .invalid:
-            print("Invalid selection. Enter 1 through \(displayedCandidates.count), or q to quit.")
-            sleep(1)
-            continue
-        case let .selectedIdentity(identity):
-            return identity
-        }
-    }
-}
-
 let args = CommandLine.arguments.dropFirst()
 let parsed: ParsedArguments
 
@@ -78,33 +36,57 @@ if parsed.wantsList {
     exit(0)
 }
 
+func runTrackingLoop(redrawInterval: TimeInterval, tracker: Tracker, redact: Bool, clicker: Clicker?) {
+    Timer.scheduledTimer(withTimeInterval: redrawInterval, repeats: true) { _ in
+        let snapshot = tracker.snapshot()
+        Display.render(snapshot, redact: redact)
+        let value = snapshot.effectiveFresh ? snapshot.effectiveLive : nil
+        clicker?.update(rssi: value)
+    }
+}
+
 let tracker = Tracker(targetName: parsed.targetName)
 tracker.start()
 
-var clicker: Clicker?
-if parsed.wantsSound {
-    clicker = Clicker()
-    if let clicker {
-        clicker.start()
-    } else {
-        FileHandle.standardError.write(Data("findphone: could not open the click sound\n".utf8))
-    }
-}
+var selectionSession: ManualSelectionSession?
 
 if parsed.wantsSelect {
-    guard let selectedIdentity = selectCandidate(tracker: tracker, redact: parsed.redact) else {
-        print("No selection made.")
-        exit(0)
-    }
-    tracker.setManualSelection(identity: selectedIdentity)
-}
+    selectionSession = ManualSelectionSession(
+        tracker: tracker,
+        redact: parsed.redact,
+        onCompletion: { selectedIdentity in
+            selectionSession = nil
 
-let renderInterval = parsed.targetName == nil && !parsed.wantsSelect ? 1.0 : 0.25
-Timer.scheduledTimer(withTimeInterval: renderInterval, repeats: true) { _ in
-    let snapshot = tracker.snapshot()
-    Display.render(snapshot, redact: parsed.redact)
-    let value = snapshot.effectiveFresh ? snapshot.effectiveLive : nil
-    clicker?.update(rssi: value)
+            guard let selectedIdentity else {
+                print("No selection made.")
+                exit(0)
+            }
+
+            tracker.setManualSelection(identity: selectedIdentity)
+
+            var clicker: Clicker?
+            if parsed.wantsSound {
+                clicker = Clicker()
+                clicker?.start()
+            }
+
+            runTrackingLoop(redrawInterval: 0.25, tracker: tracker, redact: parsed.redact, clicker: clicker)
+        }
+    )
+    selectionSession?.start()
+} else {
+    var clicker: Clicker?
+    if parsed.wantsSound {
+        clicker = Clicker()
+        if let clicker {
+            clicker.start()
+        } else {
+            FileHandle.standardError.write(Data("findphone: could not open the click sound\n".utf8))
+        }
+    }
+
+    let renderInterval = parsed.targetName == nil ? 1.0 : 0.25
+    runTrackingLoop(redrawInterval: renderInterval, tracker: tracker, redact: parsed.redact, clicker: clicker)
 }
 
 RunLoop.main.run()
