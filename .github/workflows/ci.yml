@@ -13,8 +13,6 @@ jobs:
 
       - name: Build universal binary
         run: ./scripts/build-universal.sh dist
-      - name: Verify debug build
-        run: swift build
       - name: Verify tests
         run: swift test
       - name: Verify release build

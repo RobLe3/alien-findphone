@@ -87,12 +87,6 @@ enum Trend {
     }
 }
 
-private let sparkLevels = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
-
-func sparkline(_ readings: ArraySlice<Reading>) -> String {
-    readings.map { sparkLevels[Int((Proximity.fraction($0.rssi) * 7.0).rounded())] }.joined()
-}
-
 /// Approximate RSSI-to-distance conversion for on-screen distance meters.
 ///
 /// This is a heuristic with limited precision. Use only trend and relative

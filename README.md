@@ -103,8 +103,8 @@ bundle.
 git clone https://github.com/RobLe3/alien-findphone.git
 cd alien-findphone
 
-swift build -c release
 swift test
+swift build -c release
 ```
 
 Run the built executable:
@@ -352,6 +352,28 @@ indicate stronger signal.
 These values are rough estimates only. Walls, furniture, enclosures, body position,
 and interference affect readings significantly.
 
+### Focus RSSI history
+
+The focus meter includes a short, selected-target RSSI history graph. The history
+shows recent median RSSI from left (older) to right (newer), using fixed-axis
+time buckets.
+
+- Wide and standard terminals show a multi-row ASCII graph beside the large
+  `dBm` value.
+- Compact terminals show a compact one-line ASCII history indicator.
+- Very small terminals may omit the graph to keep the signal value and menu
+  readable.
+
+Graph semantics:
+
+- Stronger RSSI values appear higher in the graph.
+- Weaker values appear lower.
+- `@` marks the selected current value (the value shown as the large `dBm` readout).
+- Empty buckets are shown as blanks; missing data is not bridged as a continuous line.
+- Oldest points appear on the left and newest points on the right.
+
+The graph is a trend aid and does not represent exact physical distance.
+
 ## Privacy
 
 Use redaction when recording the terminal:
@@ -416,10 +438,18 @@ Run the full local verification:
 
 ```bash
 swift package clean
-swift build
 swift test
 swift build -c release
 git diff --check
+```
+
+`swift test` already builds the package and test targets in SwiftPM's default
+debug configuration, so `Building for debugging...` during tests is expected.
+
+The distributable binary is built separately in release mode:
+
+```bash
+swift build -c release
 ```
 
 Run noninteractive smoke checks:

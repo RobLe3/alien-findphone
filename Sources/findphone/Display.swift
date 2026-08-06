@@ -38,14 +38,46 @@ enum Display {
     /// One write per frame; one print per frame avoids line tearing in TTY.
     static func render(_ s: Snapshot, redact: Bool = false, interactive: Bool = false, highlightedIdentity: String? = nil) {
         let (columns, rows) = terminalSize()
-        let density = tinyDensity(columns: columns, rows: rows)
-        let lines = s.targetName == nil
-            ? survey(s, columns: columns, rows: rows, density: density, redact: redact, interactive: interactive, highlightedIdentity: highlightedIdentity)
-            : hunt(s, columns: columns, rows: rows, density: density, redact: redact, interactive: interactive, highlightedIdentity: highlightedIdentity)
+        let lines = renderLines(
+            s,
+            columns: columns,
+            rows: rows,
+            redact: redact,
+            interactive: interactive,
+            highlightedIdentity: highlightedIdentity
+        )
 
         let fitted = lines.map { clampLine($0, to: columns) }
         print(clearScreen + fitted.joined(separator: "\n"), terminator: "\n")
         fflush(stdout)
+    }
+
+    /// Render only; useful for tests that need to inspect frame geometry.
+    static func renderLines(_ s: Snapshot, redact: Bool = false, interactive: Bool = false, highlightedIdentity: String? = nil) -> [String] {
+        let (columns, rows) = terminalSize()
+        return renderLines(
+            s,
+            columns: columns,
+            rows: rows,
+            redact: redact,
+            interactive: interactive,
+            highlightedIdentity: highlightedIdentity
+        )
+    }
+
+    /// Render with explicit dimensions for deterministic tests.
+    static func renderLines(
+        _ s: Snapshot,
+        columns: Int,
+        rows: Int,
+        redact: Bool = false,
+        interactive: Bool = false,
+        highlightedIdentity: String? = nil
+    ) -> [String] {
+        let density = tinyDensity(columns: columns, rows: rows)
+        return s.targetName == nil
+            ? survey(s, columns: columns, rows: rows, density: density, redact: redact, interactive: interactive, highlightedIdentity: highlightedIdentity)
+            : hunt(s, columns: columns, rows: rows, density: density, redact: redact, interactive: interactive, highlightedIdentity: highlightedIdentity)
     }
 
     private static func hunt(
@@ -213,7 +245,6 @@ enum Display {
                                       density: TinyDensity) -> [String] {
         let rangeWidth = mode == .tiny ? max(10, min(32, columns - 20)) : max(12, min(40, columns - 20))
         let barWidth = mode == .tiny ? max(12, min(26, columns - 30)) : max(20, min(meterBarWidth, columns - 30))
-        let sparkSamples = mode == .tiny ? max(8, min(24, columns - 15)) : max(12, min(44, columns - 15))
 
         var out: [String] = [Style.wrap("  \(headline) METER", Style.cyan)]
         if isManualTracking {
@@ -248,9 +279,6 @@ enum Display {
 
         let ageText = Int(at.timeIntervalSince(last.at).rounded())
         let tone = bandTones[Proximity.band(live)]
-        let digits = bigNumber(String(live)).enumerated().map { row, glyph in
-            margin + Style.wrap(glyph, tone) + (row == bigTextMiddle ? dBmSuffix : "")
-        }
         let label = Style.wrap(Proximity.describe(live).uppercased(), tone)
         let trend = trendLabel(Trend.of(sampleHistory, now: at))
 
@@ -261,19 +289,150 @@ enum Display {
             "",
             margin + Style.wrap(bar(live, width: barWidth, fill: "█", empty: "░"), tone),
             "",
-            margin + Style.wrap(sparkline(sampleHistory.suffix(sparkSamples)), Style.dim),
-            Style.wrap("\(margin)spark · via \(last.source) · refreshed \(ageText)s ago", Style.dim),
-            Style.wrap("\(margin)peak/min \(peakText) · asset \(focus.bestRSSI) dBm", Style.dim),
+            Style.wrap("\(margin)refreshed \(ageText)s ago · peak/min \(peakText)", Style.dim),
+            Style.wrap("\(margin)asset \(focus.bestRSSI) dBm · via \(last.source)", Style.dim),
             ""
         ]
 
-        if mode == .tiny {
+        out += signalHistoryBlock(
+            live: live,
+            readings: sampleHistory,
+            now: at,
+            tone: tone,
+            columns: columns,
+            mode: mode
+        )
+
+        if mode == .tiny && columns < 46 {
             out = Array(out.prefix(tinyMeterLines(density: density)))
             out.append("")
         }
-
-        out += digits
         return out
+    }
+
+    private static func signalHistoryBlock(
+        live: Int,
+        readings: [Reading],
+        now: Date,
+        tone: String,
+        columns: Int,
+        mode: HudMode
+    ) -> [String] {
+        let digits = bigNumber(String(live))
+        let riderText = "   dBm"
+        let riderWidth = riderText.count
+        let interGap = 3
+        let digitWidth = digits.first?.count ?? 0
+        let axisLabelWidth = RSSIHistoryGraph.axisLabelWidth(plotHeight: RSSIHistoryGraph.defaultPlotHeight)
+
+        switch mode {
+        case .wide, .standard:
+            let minPlotWidth = (mode == .wide) ? 28 : 16
+            let maxPlotWidth = (mode == .wide) ? 44 : 28
+            let graphBudget = columns
+                - margin.count
+                - digitWidth
+                - riderWidth
+                - interGap
+                - 1
+
+            guard graphBudget >= (minPlotWidth + axisLabelWidth) else {
+                return compactSignalHistory(
+                    live: live,
+                    readings: readings,
+                    now: now,
+                    tone: tone,
+                    columns: columns
+                )
+            }
+
+            let plotWidth = max(minPlotWidth, min(maxPlotWidth, graphBudget - axisLabelWidth))
+            let history = RSSIHistoryGraph.render(
+                readings: readings,
+                now: now,
+                currentRSSI: live,
+                plotWidth: plotWidth,
+                plotHeight: RSSIHistoryGraph.defaultPlotHeight,
+                window: RSSIHistoryGraph.defaultWindow
+            )
+
+            let caption = RSSIHistoryGraph.timeCaption(
+                for: RSSIHistoryGraph.defaultWindow,
+                graphWidth: plotWidth
+            )
+
+            let rows = history.enumerated().map { index, row in
+                let rider = (index == bigTextMiddle)
+                    ? Style.wrap(riderText, Style.dim)
+                    : String(repeating: " ", count: riderWidth)
+
+                return margin + Style.wrap(digits[index], tone) + rider
+                    + String(repeating: " ", count: interGap)
+                    + Style.wrap(row, Style.dim)
+            }
+
+            let captionPad = String(repeating: " ", count: max(0, digitWidth + riderWidth + interGap))
+            let captionRow = margin + captionPad + Style.wrap(caption, Style.dim)
+
+            return rows + [captionRow]
+
+        case .compact:
+            return compactSignalHistory(
+                live: live,
+                readings: readings,
+                now: now,
+                tone: tone,
+                columns: columns
+            )
+
+        case .tiny:
+            if columns >= 46 {
+                return compactSignalHistory(
+                    live: live,
+                    readings: readings,
+                    now: now,
+                    tone: tone,
+                    columns: columns
+                )
+            }
+
+            return digits.enumerated().map { row, glyph in
+                margin + Style.wrap(glyph, tone) + (row == bigTextMiddle ? dBmSuffix : "")
+            }
+        }
+    }
+
+    static func compactSignalHistory(
+        live: Int,
+        readings: [Reading],
+        now: Date,
+        tone: String,
+        columns: Int
+    ) -> [String] {
+        let maxPlotWidth = columns - 33
+        let width = max(4, min(24, maxPlotWidth))
+        if width < 8 { return [] }
+
+        let spark = RSSIHistoryGraph.asciiSparkline(
+            readings.suffix(256),
+            width: width,
+            now: now,
+            currentRSSI: live,
+            window: RSSIHistoryGraph.defaultWindow
+        )
+
+        return [
+            margin
+            + Style.wrap("hist:", Style.dim)
+            + " "
+            + Style.wrap(String(format: "%4d", live), tone)
+            + Style.wrap(" dBm", tone)
+            + " "
+            + Style.wrap("[", Style.dim)
+            + Style.wrap(spark, Style.dim)
+            + Style.wrap("]", Style.dim)
+            + Style.wrap(" [-100..-40]", Style.dim)
+        ]
     }
 
     private static func trendLabel(_ trend: Trend) -> String {
@@ -565,7 +724,7 @@ enum Display {
         case .compact:
             return 7
         case .ultra:
-            return 6
+            return 12
         }
     }
 
