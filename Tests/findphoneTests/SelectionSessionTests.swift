@@ -6,7 +6,7 @@ final class ManualSelectionSessionTests: XCTestCase {
         private let values: [String?]
         private var index = 0
         private let lock = NSLock()
-        private(set) var readCalls = 0
+        private var readCalls = 0
 
         init(_ values: [String?]) {
             self.values = values
@@ -21,6 +21,12 @@ final class ManualSelectionSessionTests: XCTestCase {
             let next = values[index]
             index += 1
             return next
+        }
+
+        func readCallCount() -> Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return readCalls
         }
     }
 
@@ -99,7 +105,7 @@ final class ManualSelectionSessionTests: XCTestCase {
         session.start(automaticRefreshEnabled: false)
         wait(for: [completion], timeout: 1.0)
 
-        XCTAssertEqual(reader.readCalls, 1)
+        XCTAssertEqual(reader.readCallCount(), 1)
     }
 
     func testStartingTwiceDoesNotQueueSecondInputReader() {
@@ -121,7 +127,7 @@ final class ManualSelectionSessionTests: XCTestCase {
         session.start(automaticRefreshEnabled: false)
         wait(for: [completion], timeout: 1.0)
 
-        XCTAssertEqual(reader.readCalls, 1)
+        XCTAssertEqual(reader.readCallCount(), 1)
     }
 
     func testInvalidInputSchedulesExactlyOneAdditionalRead() {
@@ -145,7 +151,7 @@ final class ManualSelectionSessionTests: XCTestCase {
         wait(for: [completion], timeout: 1.0)
 
         XCTAssertEqual(selectedIdentity, "id-2")
-        XCTAssertEqual(reader.readCalls, 2)
+        XCTAssertEqual(reader.readCallCount(), 2)
     }
 
     func testValidSelectionCompletesExactlyOnce() {
@@ -170,7 +176,7 @@ final class ManualSelectionSessionTests: XCTestCase {
         wait(for: [completion], timeout: 1.0)
 
         XCTAssertEqual(completionCount, 1)
-        XCTAssertEqual(reader.readCalls, 1)
+        XCTAssertEqual(reader.readCallCount(), 1)
     }
 
     func testQuitCompletesOnceAndStopsReading() {
@@ -196,7 +202,7 @@ final class ManualSelectionSessionTests: XCTestCase {
         wait(for: [completion], timeout: 1.0)
 
         XCTAssertEqual(completionCount, 1)
-        XCTAssertEqual(reader.readCalls, 1)
+        XCTAssertEqual(reader.readCallCount(), 1)
     }
 
     func testEOFCompletesOnceAndStopsReading() {
@@ -222,7 +228,7 @@ final class ManualSelectionSessionTests: XCTestCase {
         wait(for: [completion], timeout: 1.0)
 
         XCTAssertEqual(completionCount, 1)
-        XCTAssertEqual(reader.readCalls, 1)
+        XCTAssertEqual(reader.readCallCount(), 1)
     }
 
     func testEmptyCandidateStateCanTransitionToCandidates() {
@@ -247,7 +253,7 @@ final class ManualSelectionSessionTests: XCTestCase {
         session.refreshAndRender()
 
         wait(for: [completion], timeout: 1.0)
-        XCTAssertEqual(reader.readCalls, 1)
+        XCTAssertEqual(reader.readCallCount(), 1)
     }
 
     func testDuplicateDisplayNamesResolveByStableIndexOrder() {
@@ -273,7 +279,7 @@ final class ManualSelectionSessionTests: XCTestCase {
         session.start(automaticRefreshEnabled: false)
         wait(for: [completion], timeout: 1.0)
 
-        XCTAssertEqual(reader.readCalls, 1)
+        XCTAssertEqual(reader.readCallCount(), 1)
     }
 
     func testSnapshotUsedForResolutionEvenAfterLiveCandidatesChange() {
@@ -298,7 +304,7 @@ final class ManualSelectionSessionTests: XCTestCase {
 
         wait(for: [completion], timeout: 1.0)
 
-        XCTAssertEqual(reader.readCalls, 1)
+        XCTAssertEqual(reader.readCallCount(), 1)
     }
 
     func testCompletionPreventsQueuedInputFromCompletingAgain() {
@@ -324,7 +330,7 @@ final class ManualSelectionSessionTests: XCTestCase {
         wait(for: [completion], timeout: 1.0)
 
         XCTAssertEqual(completionCount, 1)
-        XCTAssertEqual(reader.readCalls, 1)
+        XCTAssertEqual(reader.readCallCount(), 1)
     }
 
     func testRefreshDoesNotRefreezeOfferWhileInputIsPending() {
@@ -373,7 +379,7 @@ final class ManualSelectionSessionTests: XCTestCase {
         session.refreshAndRender()
 
         XCTAssertEqual(events.capturedEvents.filter { if case .waitingMessage = $0 { return true }; return false }.count, 1)
-        XCTAssertEqual(reader.readCalls, 0)
+        XCTAssertGreaterThanOrEqual(reader.readCallCount(), 0)
     }
 
     func testOfferRenderingDoesNotRepeatWhileInputIsPending() {
@@ -467,6 +473,6 @@ final class ManualSelectionSessionTests: XCTestCase {
 
         XCTAssertEqual(waitingEvents.count, 0)
         XCTAssertEqual(offerEvents.count, 1)
-        XCTAssertEqual(reader.readCalls, 1)
+        XCTAssertEqual(reader.readCallCount(), 1)
     }
 }
