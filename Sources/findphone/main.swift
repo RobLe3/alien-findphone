@@ -10,8 +10,9 @@ func selectCandidate(tracker: Tracker, redact: Bool) -> String? {
 
     while true {
         let snapshot = tracker.snapshot()
+        let displayedCandidates = snapshot.candidates
 
-        if snapshot.candidates.isEmpty {
+        if displayedCandidates.isEmpty {
             print("Nearby Apple handhelds — no candidates yet")
             print("Waiting for nearby devices... (or press q to quit)")
             if let input = readLine(strippingNewline: true), input.lowercased() == "q" {
@@ -22,7 +23,7 @@ func selectCandidate(tracker: Tracker, redact: Bool) -> String? {
         }
 
         print("Nearby Apple handhelds — select one to track:\n")
-        for (index, candidate) in snapshot.candidates.enumerated() {
+        for (index, candidate) in displayedCandidates.enumerated() {
             let live = Int(candidate.smoothed.rounded())
             let stale = snapshot.at.timeIntervalSince(candidate.last) > 3 ? " (stale)" : ""
             let name = redact ? candidate.kind : candidate.label
@@ -32,19 +33,17 @@ func selectCandidate(tracker: Tracker, redact: Bool) -> String? {
 
         print("Select a device number, or q to quit: ", terminator: "")
         guard let raw = readLine(strippingNewline: true) else { return nil }
-        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        if value.lowercased() == "q" {
+        switch CandidateSelectionResolver.resolve(rawInput: raw, candidates: displayedCandidates) {
+        case .quit:
             return nil
-        }
-
-        guard let selected = Int(value), selected > 0, selected <= snapshot.candidates.count else {
-            print("Invalid selection. Enter 1 through \(snapshot.candidates.count), or q to quit.")
+        case .invalid:
+            print("Invalid selection. Enter 1 through \(displayedCandidates.count), or q to quit.")
             sleep(1)
             continue
+        case let .selectedIdentity(identity):
+            return identity
         }
-
-        return snapshot.candidates[selected - 1].identity
     }
 }
 
